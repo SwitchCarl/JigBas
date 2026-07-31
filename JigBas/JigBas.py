@@ -1,0 +1,2 @@
+import wespeaker
+print("a")
