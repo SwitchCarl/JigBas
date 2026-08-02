@@ -12,7 +12,8 @@
     <Name>JigBas</Name>
     <RootNamespace>JigBas</RootNamespace>
     <IsWindowsApplication>False</IsWindowsApplication>
-    <InterpreterId>Global|VisualStudio|Python 3.10</InterpreterId>
+    <InterpreterId>CondaEnv|CondaEnv|JigbasEnv</InterpreterId>
+    <SuppressEnvironmentCreationPrompt>True</SuppressEnvironmentCreationPrompt>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)' == 'Debug' ">
     <DebugSymbols>true</DebugSymbols>
@@ -24,8 +25,11 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="JigBas.py" />
+    <Compile Include="verify_env.py" />
+    <Compile Include="ui.py" />
   </ItemGroup>
   <ItemGroup>
+    <InterpreterReference Include="CondaEnv|CondaEnv|JigbasEnv" />
     <InterpreterReference Include="Global|VisualStudio|Python 3.10" />
   </ItemGroup>
   <Import Project="$(MSBuildExtensionsPath32)\Microsoft\VisualStudio\v$(VisualStudioVersion)\Python Tools\Microsoft.PythonTools.targets" />
