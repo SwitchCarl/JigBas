@@ -1,13 +1,13 @@
 # ==============================================================
 # JigBas UI — 抗干扰语音指令识别系统界面
 # 控制台风格界面：方向键 + 回车 控制
+# 仅负责界面显示与交互；模型相关功能见 core.py
 #
 # - 启动时派生独立控制台窗口运行界面，日志回传原窗口
 # - 窗口大小固定（定时强制恢复 + 移除拉伸样式）
 # - 模块由制表符盒子包围，选中模块亮青色双边框高亮
 # - 识别结果内联显示在主界面，识别过程进度实时刷新
 # - 音频模块：回车 = 键入路径，Ctrl+回车 = Explorer 选择
-# - 支持唤醒音频 + 识别音频：声纹相似度达标才转写，否则拒识
 # ==============================================================
 
 import os
@@ -18,14 +18,13 @@ import threading
 import logging
 import warnings
 import unicodedata
-from contextlib import redirect_stdout
+
+from core import ModelHub, recognize
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-MODELS_DIR = os.path.join(PROJECT_ROOT, "Models")
-FUNASR_MODEL_DIR = os.path.join(MODELS_DIR, "speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch")
 
 UI_CHILD_FLAG = "--ui-child"
 WINDOW_TITLE = "JigBas — 抗干扰语音指令识别系统"
@@ -274,13 +273,10 @@ def render(lines):
 
 
 # ---------------------------------------------------------------
-# 全局模型引用（延迟加载）
+# 模型中心（core.py 统一管理，此处仅镜像状态用于显示）
 # ---------------------------------------------------------------
-wespeaker_model = None
-funasr_model = None
-
-# 模型加载状态: "等待" / "加载中" / "就绪" / "失败"
-model_status = {"wespeaker": "等待", "funasr": "等待"}
+hub = ModelHub()
+model_status = hub.status  # 与 core 共享状态字典
 
 
 def load_progress():
@@ -350,43 +346,19 @@ def read_key_timeout(sec):
 
 
 # ---------------------------------------------------------------
-# 模型加载（日志走 stdout → 管道 → 原窗口）
+# 模型加载（core 执行，日志走 stdout → 管道 → 原窗口）
 # ---------------------------------------------------------------
 def load_models_in_background():
     def run():
-        global wespeaker_model, funasr_model
-        try:
-            model_status["wespeaker"] = "加载中"
-            print("[模型] 正在加载 Wespeaker 声纹模型...", flush=True)
-            import wespeaker
-            with open(os.devnull, "w") as f, redirect_stdout(f):
-                wespeaker_model = wespeaker.load_model("chinese")
-            model_status["wespeaker"] = "就绪"
-            print("[模型] Wespeaker 声纹模型加载完成", flush=True)
-
-            model_status["funasr"] = "加载中"
-            print("[模型] 正在加载 FunASR ASR 模型...", flush=True)
-            from funasr import AutoModel
-            if os.path.isdir(FUNASR_MODEL_DIR) and os.listdir(FUNASR_MODEL_DIR):
-                funasr_model = AutoModel(model=FUNASR_MODEL_DIR)
-            else:
-                funasr_model = AutoModel(
-                    model="iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch"
-                )
-            model_status["funasr"] = "就绪"
-            print("[模型] FunASR ASR 模型加载完成", flush=True)
-        except Exception as e:
-            for k, v in model_status.items():
-                if v != "就绪":
-                    model_status[k] = "失败"
+        hub.load(log=lambda m: print(m, flush=True))
+        if not hub.ready():
             state.message = "模型加载失败，详见原窗口日志"
-            print(f"[模型] 加载失败: {e}", flush=True)
 
     threading.Thread(target=run, daemon=True).start()
 
 
 def models_ready():
-    return model_status["wespeaker"] == "就绪" and model_status["funasr"] == "就绪"
+    return hub.ready()
 
 
 # ---------------------------------------------------------------
@@ -544,22 +516,8 @@ def _set_audio_path(target, path):
 
 
 # ---------------------------------------------------------------
-# 识别流程（后台线程驱动，结果内联刷新到主界面）
+# 识别流程（core.recognize 执行，结果内联刷新到主界面）
 # ---------------------------------------------------------------
-def _cosine(a, b):
-    import numpy as np
-    a = np.asarray(a, dtype=np.float64).ravel()
-    b = np.asarray(b, dtype=np.float64).ravel()
-    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8))
-
-
-def _extract_embedding(path):
-    """提取声纹嵌入（屏蔽库自身的刷屏输出）"""
-    with open(os.devnull, "w") as f, redirect_stdout(f):
-        emb = wespeaker_model.extract_embedding(path)
-    return emb.cpu().numpy() if hasattr(emb, "cpu") else emb
-
-
 def _set_stage(name):
     state.run_stage = name
     state.run_stage_t0 = time.time()
@@ -596,55 +554,22 @@ def start_recognition():
     _set_stage("wake")
 
     def work():
-        holder = {}
-        try:
-            print(f"[识别] 唤醒音频: {state.wake_path}", flush=True)
-            print(f"[识别] 识别音频: {state.audio_path}", flush=True)
+        result = recognize(
+            hub, state.wake_path, state.audio_path, state.threshold,
+            on_stage=_set_stage, log=lambda m: print(m, flush=True))
 
-            _set_stage("wake")
-            print("[识别] 提取唤醒音频声纹...", flush=True)
-            emb_wake = _extract_embedding(state.wake_path)
-
-            _set_stage("rec")
-            print("[识别] 提取识别音频声纹...", flush=True)
-            emb_rec = _extract_embedding(state.audio_path)
-
-            sim = _cosine(emb_wake, emb_rec)
-            holder["sim"] = sim
-            print(f"[识别] 余弦相似度: {sim:.4f} (阈值 {state.threshold:.2f})", flush=True)
-
-            if sim >= state.threshold:
-                holder["accepted"] = True
-                _set_stage("asr")
-                print("[识别] 判为目标说话人，执行 ASR 转写...", flush=True)
-                asr_result = funasr_model.generate(input=state.audio_path)
-                text = ""
-                if asr_result and len(asr_result) > 0:
-                    text = (asr_result[0].get("text", "")
-                            if isinstance(asr_result[0], dict) else str(asr_result[0]))
-                holder["text"] = text
-            else:
-                holder["accepted"] = False
-                print("[识别] 判为非目标说话人，拒识（输出空）", flush=True)
-        except Exception as e:
-            holder["error"] = str(e)
-            print(f"[识别] 失败: {e}", flush=True)
-
-        elapsed = time.time() - state.run_t0
-        print(f"[识别] 完成，总耗时 {elapsed:.2f}s", flush=True)
-
-        if "error" in holder:
-            state.result_lines = [f"{C_ERR}识别失败: {holder['error']}{C_RESET}"]
+        if result["error"]:
+            state.result_lines = [f"{C_ERR}识别失败: {result['error']}{C_RESET}"]
         else:
-            sim = holder.get("sim", 0.0)
+            sim = result["similarity"]
             lines = [
                 f"唤醒: {truncate_middle(state.wake_path, 76)}",
                 f"识别: {truncate_middle(state.audio_path, 76)}",
                 "",
                 f"声纹相似度: {C_TITLE}{sim:.4f}{C_RESET}   阈值: {state.threshold:.2f}",
             ]
-            if holder.get("accepted"):
-                text = holder.get("text", "")
+            if result["accepted"]:
+                text = result["text"] or ""
                 lines += [
                     f"判决结果: {C_OK}目标说话人{C_RESET}",
                     f"转写内容: {C_TITLE}{text if text else '（无内容）'}{C_RESET}",
@@ -654,7 +579,7 @@ def start_recognition():
                     f"判决结果: {C_WARN}非目标说话人 — 已拒识{C_RESET}",
                     f"转写内容: {C_DIM}（空）{C_RESET}",
                 ]
-            lines += ["", f"推理耗时: {elapsed:.2f}s"]
+            lines += ["", f"推理耗时: {result['elapsed']:.2f}s"]
             state.result_lines = lines
 
         state.is_running = False

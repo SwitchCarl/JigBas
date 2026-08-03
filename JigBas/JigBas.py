@@ -58,7 +58,7 @@ def main():
     deps_ok = _show_deps_status()
 
     if not deps_ok:
-        print("\n[WARN] 部分核心依赖缺失，请先运行: pip install -r requirements.txt")
+        print("\n[WARN] 部分依赖缺失，请先运行: pip install -r requirements.txt")
         sys.exit(1)
 
     menu = {
