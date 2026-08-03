@@ -12,7 +12,7 @@
     <Name>JigBas</Name>
     <RootNamespace>JigBas</RootNamespace>
     <IsWindowsApplication>False</IsWindowsApplication>
-    <InterpreterId>CondaEnv|CondaEnv|JigbasEnv</InterpreterId>
+    <InterpreterId>CondaEnv|CondaEnv|JigBasEnv</InterpreterId>
     <SuppressEnvironmentCreationPrompt>True</SuppressEnvironmentCreationPrompt>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)' == 'Debug' ">
@@ -30,7 +30,7 @@
     <Compile Include="ui.py" />
   </ItemGroup>
   <ItemGroup>
-    <InterpreterReference Include="CondaEnv|CondaEnv|JigbasEnv" />
+    <InterpreterReference Include="CondaEnv|CondaEnv|JigBasEnv" />
   </ItemGroup>
   <Import Project="$(MSBuildExtensionsPath32)\Microsoft\VisualStudio\v$(VisualStudioVersion)\Python Tools\Microsoft.PythonTools.targets" />
   <!-- Uncomment the CoreCompile target to enable the Build command in
