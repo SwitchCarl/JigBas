@@ -19,10 +19,23 @@ STATUS_READY = "就绪"
 STATUS_FAILED = "失败"
 
 
+def _default_device():
+    """有 CUDA 用 GPU，否则回退 CPU"""
+    try:
+        import torch
+        return "cuda:0" if torch.cuda.is_available() else "cpu"
+    except ImportError:
+        return "cpu"
+
+
 class ModelHub:
     """集中管理声纹模型与 ASR 模型的加载与访问"""
 
-    def __init__(self):
+    def __init__(self, device=None, wespeaker_device="cpu"):
+        # wespeaker 固定 CPU：其 fbank 前端在库内不随 set_device 迁移，
+        # 放 GPU 会设备不匹配崩溃；且 CPU 提取嵌入仅 ~0.4s/条，收益微小
+        self.device = device or _default_device()
+        self.wespeaker_device = wespeaker_device
         self.wespeaker = None
         self.funasr = None
         self.status = {
@@ -46,21 +59,23 @@ class ModelHub:
 
     def _load_wespeaker(self, log):
         self.status["wespeaker"] = STATUS_LOADING
-        log("[模型] 正在加载 Wespeaker 声纹模型...")
+        log(f"[模型] 正在加载 Wespeaker 声纹模型（{self.wespeaker_device}）...")
         import wespeaker
         with open(os.devnull, "w") as f, redirect_stdout(f):
             self.wespeaker = wespeaker.load_model("chinese")
+        self.wespeaker.set_device(self.wespeaker_device)
         self.status["wespeaker"] = STATUS_READY
         log("[模型] Wespeaker 声纹模型加载完成")
 
     def _load_funasr(self, log):
         self.status["funasr"] = STATUS_LOADING
-        log("[模型] 正在加载 FunASR ASR 模型...")
+        log(f"[模型] 正在加载 FunASR ASR 模型（{self.device}）...")
         from funasr import AutoModel
+        kwargs = {"device": self.device, "disable_update": True}
         if os.path.isdir(FUNASR_MODEL_DIR) and os.listdir(FUNASR_MODEL_DIR):
-            self.funasr = AutoModel(model=FUNASR_MODEL_DIR)
+            self.funasr = AutoModel(model=FUNASR_MODEL_DIR, **kwargs)
         else:
-            self.funasr = AutoModel(model=FUNASR_MODEL_ID)
+            self.funasr = AutoModel(model=FUNASR_MODEL_ID, **kwargs)
         self.status["funasr"] = STATUS_READY
         log("[模型] FunASR ASR 模型加载完成")
 

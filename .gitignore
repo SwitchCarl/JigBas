@@ -372,6 +372,14 @@ env/
 # Pre-trained models (只读，不会被修改)
 JigBas/Models/
 
+# 下载的依赖安装包（torch wheel 等，体积大）
+wheels/
+
+# 语料压缩包与下载临时文件（体积大，不入库）
+*.tgz
+*.tar.gz
+*.crdownload
+
 # Byte-compiled / optimized
 __pycache__/
 *.py[cod]

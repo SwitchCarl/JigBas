@@ -1,0 +1,2 @@
+{"id": "smoke_pos", "type": "positive", "sim": 0.6145640047047165, "ref": "充满了营养的一个一个大的作品使得我们能够也跟着成长", "hyp_asr": "充满了营养的一个一个大的作品使得我们能够也跟着成长", "elapsed": 0.8829653263092041, "duration": 5.0, "error": null}
+{"id": "smoke_rej", "type": "rejection", "sim": 0.009069011310974966, "ref": "", "hyp_asr": null, "elapsed": 0.11474847793579102, "duration": 5.0, "error": null}
