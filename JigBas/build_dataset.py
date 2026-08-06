@@ -136,7 +136,9 @@ def lhotse_mix(target, other, snr_db, ref_id="t", oth_id="o"):
 
 def lhotse_speed_perturb(x, rng, lo=0.9, hi=1.1):
     """变速扰动（Lhotse perturb_speed，Kaldi 风格，音调随速度变化）"""
-    factor = rng.uniform(lo, hi)
+    # 因子保留两位小数：保证 16000*factor 为整数且与 16000 有大公约数，
+    # 否则 torchaudio 多相重采样滤波器会膨胀到 GB 级，直接撑爆内存/崩溃
+    factor = round(float(rng.uniform(lo, hi)), 2)
     if abs(factor - 1.0) < 1e-3:
         return x, 1.0
     rec = rec_from_array(x, "sp").perturb_speed(factor, affix_id=False)
