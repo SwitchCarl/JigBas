@@ -33,7 +33,6 @@ import io
 import json
 import math
 import os
-import random
 import re
 import sys
 
@@ -394,7 +393,10 @@ def generate_sample(idx, split, kind, speakers, speaker_ids, rng,
 # 数据集构建主流程
 # ---------------------------------------------------------------
 def build(args):
-    rng = random.Random(args.seed)
+    # 脚本内混用了 numpy Generator 风格 API（integers/standard_normal），
+    # 必须用 np.random.default_rng，不能用 random.Random
+    rng = np.random.default_rng(args.seed)
+    os.makedirs(args.output, exist_ok=True)
 
     print(f"[扫描] 干净语料: {args.clean_dir}")
     transcripts = load_transcripts(args.clean_dir, args.transcript)
