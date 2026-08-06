@@ -53,6 +53,40 @@ def menu_ui():
     ui_main()
 
 
+def menu_build_dataset():
+    """3. 构建数据集 — Lhotse 混音生成三元组（回车使用默认值）"""
+    import argparse
+    import build_dataset as bd
+
+    def _ask(prompt, default):
+        s = input(f"  {prompt} [{default}] > ").strip()
+        return s or default
+
+    print("数据集构建参数（直接回车使用默认值）：")
+    try:
+        args = argparse.Namespace(
+            clean_dir=_ask("干净语料目录", bd.DEFAULT_CLEAN_DIR),
+            transcript=_ask("转写文件（留空自动探测）", bd.DEFAULT_TRANSCRIPT) or None,
+            noise_dir=_ask("噪声库目录", bd.DEFAULT_NOISE_DIR),
+            rir_dir=_ask("RIR 混响目录", bd.DEFAULT_RIR_DIR),
+            output=_ask("输出目录", bd.DEFAULT_OUTPUT),
+            num_train=int(_ask("train 样本数", "2000")),
+            num_dev=int(_ask("dev 样本数", "200")),
+            reject_ratio=0.3,
+            overlap_prob=0.4,
+            dev_speaker_ratio=0.1,
+            trim=True,
+            seed=42,
+        )
+    except (EOFError, KeyboardInterrupt):
+        print("\n已取消。")
+        return
+
+    bd.build(args)
+    print()
+    bd.stats(args)
+
+
 def main():
     _show_banner()
     deps_ok = _show_deps_status()
@@ -62,9 +96,10 @@ def main():
         sys.exit(1)
 
     menu = {
-        "1": ("验证环境", menu_verify),
-        "2": ("启动界面", menu_ui),
-        "0": ("退出",     None),
+        "1": ("验证环境",   menu_verify),
+        "2": ("启动界面",   menu_ui),
+        "3": ("构建数据集", menu_build_dataset),
+        "0": ("退出",       None),
     }
 
     while True:

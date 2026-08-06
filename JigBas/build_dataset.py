@@ -25,7 +25,7 @@
 #   python build_dataset.py --clean-dir D:\corpus\data_aishell\wav\train \
 #         --noise-dir D:\corpus\musan\noise --output Dataset \
 #         --num-train 2000 --num-dev 200
-#   python build_dataset.py --stats --output Dataset   # 统计已生成数据集
+#   python build_dataset.py --stats    # 统计已生成数据集（默认输出目录）
 # ==============================================================
 
 import argparse
@@ -40,6 +40,21 @@ import numpy as np
 import soundfile as sf
 
 SAMPLE_RATE = 16000
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# 默认产物目录：仓库外的 E:\Desktop\Jigbas\Temp\Dataset（体积大，不入库）
+DEFAULT_OUTPUT = os.path.normpath(
+    os.path.join(SCRIPT_DIR, "..", "..", "Temp", "Dataset"))
+# 默认语料路径（仓库内 Datasets/，不存在时由用户通过参数覆盖）
+DEFAULT_CLEAN_DIR = os.path.normpath(
+    os.path.join(SCRIPT_DIR, "..", "Datasets", "data_aishell", "wav", "train"))
+DEFAULT_NOISE_DIR = os.path.normpath(
+    os.path.join(SCRIPT_DIR, "..", "Datasets", "musan", "noise"))
+DEFAULT_RIR_DIR = os.path.normpath(
+    os.path.join(SCRIPT_DIR, "..", "Datasets", "sim_rir_8k"))
+DEFAULT_TRANSCRIPT = os.path.normpath(
+    os.path.join(SCRIPT_DIR, "..", "Datasets", "data_aishell",
+                 "transcript", "aishell_transcript_v0.8.txt"))
 
 # ---------------------------------------------------------------
 # 基础音频工具
@@ -223,7 +238,14 @@ def load_transcripts(clean_dir, transcript_file=None):
         _load_file(transcript_file)
         return table
 
-    search_dirs = [clean_dir, os.path.dirname(os.path.normpath(clean_dir))]
+    search_dirs = [clean_dir]
+    # 向上追溯两级祖先目录（兼容 AISHELL-1 的 data_aishell/wav/train
+    # + data_aishell/transcript 布局：转写在祖父目录的子目录里）
+    d = os.path.normpath(clean_dir)
+    for _ in range(2):
+        d = os.path.dirname(d)
+        if d and d not in search_dirs:
+            search_dirs.append(d)
     for d in search_dirs:
         if not d or not os.path.isdir(d):
             continue
@@ -409,8 +431,13 @@ def build(args):
         sys.exit(1)
 
     n_utts = sum(len(u) for u in speakers.values())
+    n_hits = sum(1 for u in speakers.values() for x in u if x['text'])
     print(f"[扫描] 说话人 {len(speakers)} 个，有效音频 {n_utts} 条，"
-          f"转写命中 {sum(1 for u in speakers.values() for x in u if x['text'])} 条")
+          f"转写命中 {n_hits} 条")
+    if n_hits == 0:
+        print("[错误] 转写命中 0 条，生成的正样本将没有文本标注，数据集不可用。")
+        print("       请用 --transcript 显式指定转写文件后重试。")
+        sys.exit(1)
 
     noise_paths = scan_audio_dir(args.noise_dir)
     rir_paths = scan_audio_dir(args.rir_dir)
@@ -493,7 +520,8 @@ def main():
     ap.add_argument("--transcript", help="全局转写文件（utt_id 文本），可选")
     ap.add_argument("--noise-dir", help="噪声库目录（MUSAN noise 等）")
     ap.add_argument("--rir-dir", help="房间冲激响应目录（可选）")
-    ap.add_argument("--output", default="Dataset", help="输出目录（默认 Dataset）")
+    ap.add_argument("--output", default=DEFAULT_OUTPUT,
+                    help=f"输出目录（默认 {DEFAULT_OUTPUT}）")
     ap.add_argument("--num-train", type=int, default=2000)
     ap.add_argument("--num-dev", type=int, default=200)
     ap.add_argument("--reject-ratio", type=float, default=0.3,
