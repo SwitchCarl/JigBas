@@ -380,6 +380,10 @@ wheels/
 *.tar.gz
 *.crdownload
 
+# 原始语料与构建产物（AISHELL/MUSAN/RIR 及生成的数据集，体积大）
+Datasets/
+Dataset/
+
 # Byte-compiled / optimized
 __pycache__/
 *.py[cod]
