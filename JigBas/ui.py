@@ -1,25 +1,31 @@
 # ==============================================================
 # JigBas UI — 抗干扰语音指令识别系统界面
-# 控制台风格界面：方向键 + 回车 控制
-# 仅负责界面显示与交互；模型相关功能见 core.py
+# 控制台风格界面：方向键 + Enter 控制
+# 仅负责界面显示与交互；模型见 models.py，识别见 demo.py
 #
-# - 启动时派生独立控制台窗口运行界面，日志回传原窗口
-# - 窗口大小固定（定时强制恢复 + 移除拉伸样式）
-# - 模块由制表符盒子包围，选中模块亮青色双边框高亮
-# - 识别结果内联显示在主界面，识别过程进度实时刷新
-# - 音频模块：回车 = 键入路径，Ctrl+回车 = Explorer 选择
+# - 启动后先进入模型加载页：仅进度条 + 动画，就绪后才进入正式 UI
+# - 顶部模块栏：基础演示 / 数据集搭建（启用模块用双制表符+亮色）
+# - 基础演示：单条目标说话人识别（进程内跑，等价 python demo.py）
+# - 数据集搭建（单页）：左上入口（搭建/评估），右侧数据集竖列表，
+#   下方信息框显详情/调参数；入口上按 Enter = 派生子进程执行等价
+#   命令行（--progress 结构化进度），日志回传原窗口
+# - 窗口大小固定，选中项亮青色高亮
 # ==============================================================
 
 import os
 import re
 import sys
+import json
 import time
 import threading
 import logging
 import warnings
 import unicodedata
 
-from core import ModelHub, recognize
+import datasets as ds
+import build_dataset as bd
+from models import ModelHub
+from demo import recognize, DEFAULT_THRESHOLD
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
@@ -31,9 +37,8 @@ WINDOW_TITLE = "JigBas — 抗干扰语音指令识别系统"
 
 # 窗口尺寸（字符）
 WIN_COLS = 94
-WIN_ROWS = 30
+WIN_ROWS = 36
 CONTENT_W = WIN_COLS - 2
-LEFT_W = 30  # 左侧“模型状态”列宽
 
 # ANSI 颜色
 C_RESET = "\x1b[0m"
@@ -45,6 +50,8 @@ C_WARN = "\x1b[93m"
 C_ERR = "\x1b[91m"
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+PROGRESS_PREFIX = "[PROGRESS] "
 
 
 # ---------------------------------------------------------------
@@ -146,10 +153,14 @@ SINGLE = ("┌", "┐", "└", "┘", "─", "│")
 DOUBLE = ("╔", "╗", "╚", "╝", "═", "║")
 
 
-def make_box(title, lines, width, selected=False, min_height=None):
-    """生成一个盒子，返回字符串行列表（每行可见宽度 == width）"""
-    tl, tr, bl, br, h, v = DOUBLE if selected else SINGLE
-    color = C_SEL if selected else C_DIM
+def make_box(title, lines, width, selected=False, min_height=None, style=None):
+    """生成一个盒子，返回字符串行列表（每行可见宽度 == width）
+    style=(制表符六元组, 颜色) 可覆盖 selected 推导出的默认样式"""
+    if style:
+        (tl, tr, bl, br, h, v), color = style
+    else:
+        tl, tr, bl, br, h, v = DOUBLE if selected else SINGLE
+        color = C_SEL if selected else C_DIM
     inner = width - 2
 
     lines = list(lines)
@@ -172,6 +183,13 @@ def hcat(box_a, box_b, gap=2):
     box_a = box_a + [box_a[-1]] * (n - len(box_a))
     box_b = box_b + [box_b[-1]] * (n - len(box_b))
     return [a + " " * gap + b for a, b in zip(box_a, box_b)]
+
+
+def vcat(*groups):
+    rows = []
+    for g in groups:
+        rows += g
+    return rows
 
 
 # ---------------------------------------------------------------
@@ -267,16 +285,16 @@ def _show_cursor(show):
 
 
 def render(lines):
-    """整帧渲染"""
+    """整帧渲染（超出窗口高度的行截断）"""
     _clear_screen()
-    _emit("\n".join(" " + line for line in lines))
+    _emit("\n".join(" " + line for line in lines[:WIN_ROWS - 1]))
 
 
 # ---------------------------------------------------------------
-# 模型中心（core.py 统一管理，此处仅镜像状态用于显示）
+# 模型中心（models.py 统一管理，此处仅镜像状态用于显示）
 # ---------------------------------------------------------------
 hub = ModelHub()
-model_status = hub.status  # 与 core 共享状态字典
+model_status = hub.status  # 与 models 共享状态字典
 
 
 def load_progress():
@@ -286,27 +304,89 @@ def load_progress():
             + seg.get(model_status["funasr"], 0.0)) / 2.0
 
 
+def load_failed():
+    return any(v == "失败" for v in model_status.values())
+
+
 # ---------------------------------------------------------------
 # 界面状态
 # ---------------------------------------------------------------
+MODULES = ["基础演示", "数据集搭建"]
+
+# 构建参数表：(key, 标签, 默认值, 类型)  类型: text/int/float/dir/file
+BUILD_PARAMS = [
+    ("alias",        "数据集别名",   "run",                 "text"),
+    ("clean_dir",    "干净语料目录", bd.DEFAULT_CLEAN_DIR,  "dir"),
+    ("transcript",   "转写文件",     bd.DEFAULT_TRANSCRIPT, "file"),
+    ("noise_dir",    "噪声库目录",   bd.DEFAULT_NOISE_DIR,  "dir"),
+    ("rir_dir",      "RIR 混响目录", bd.DEFAULT_RIR_DIR,    "dir"),
+    ("num_train",    "train 样本数", "2000",                "int"),
+    ("num_dev",      "dev 样本数",   "200",                 "int"),
+    ("reject_ratio", "拒识样本占比", "0.3",                 "float"),
+    ("overlap_prob", "双人重叠概率", "0.4",                 "float"),
+    ("seed",         "随机种子",     "42",                  "int"),
+]
+
+# 数值型参数的 ←→ 步长与进度条量程: key -> (lo, hi, step)
+# 有明确含义区间的比值参数才显示进度条；样本数/种子只步进不显示进度条
+BUILD_ADJUST = {
+    "num_train":    (0, None, 100),
+    "num_dev":      (0, None, 50),
+    "reject_ratio": (0.0, 1.0, 0.05),
+    "overlap_prob": (0.0, 1.0, 0.05),
+    "seed":         (0, None, 1),
+}
+# 显示进度条的参数（有固定量程的比值）
+BUILD_BAR = {"reject_ratio", "overlap_prob"}
+
+# 评估参数（数据集在右侧列表选择）：(key, 标签, 类型)
+EVAL_PARAMS = [
+    ("split",  "划分",     "toggle:train:dev"),
+    ("sweep",  "阈值扫描", "text"),
+    ("limit",  "条数限制", "num"),
+    ("detail", "逐样本明细", "toggle"),
+]
+
+
 class AppState:
     def __init__(self):
-        self.wake_path = ""           # 唤醒音频
-        self.audio_path = ""          # 识别音频
-        self.threshold = 0.50         # 拒识阈值（余弦相似度）
-        self.focus = 0                # 当前选中模块
-        self.message = ""             # 底部提示
-        # 识别状态（后台线程驱动，主界面内联刷新）
+        self.load_gate = True     # 模型加载页（就绪或失败后确认才关闭）
+        self.layer = "bar"        # bar=焦点在模块栏 / content=焦点在模块内容
+        self.module = 0           # 当前启用的模块
+        self.message = ""         # 底部提示
+
+        # 基础演示
+        self.wake_path = ""
+        self.audio_path = ""
+        self.threshold = DEFAULT_THRESHOLD
+        self.demo_focus = 0
         self.is_running = False
         self.run_t0 = 0.0
-        self.run_stage = ""           # 识别阶段: wake / rec / asr
+        self.run_stage = ""
         self.run_stage_t0 = 0.0
-        self.result_lines = []        # 最终识别结果（空 = 尚未识别）
+        self.result_lines = []
+
+        # 数据集搭建（单页：zone=entry/param/ds）
+        self.zone = "entry"       # entry=入口行 / param=信息框调参 / ds=右侧数据集列表
+        self.entry = 0            # 0=搭建数据集 1=评估数据集
+        self.param_idx = 0
+        self.ds_entries = []      # 已有数据集摘要
+        self.ds_sel = 0           # 右侧列表当前选中（评估目标）
+        self.build_vals = {k: v for k, _, v, _ in BUILD_PARAMS}
+        self.eval_split = "dev"
+        self.eval_sweep = "0.30:0.75:0.05"
+        self.eval_limit = "0"
+        self.eval_detail = True
+
+        # 长任务（构建/评估）运行状态
+        self.task = None          # 见 start_task()
+        self.task_acked = True    # 完成后是否已被用户按键确认（切回选择视图）
+
 
 state = AppState()
 
-# 主界面可选模块（焦点顺序）
-MODULES = ["wake", "rec", "threshold", "start"]
+# 基础演示可选模块（焦点顺序）
+DEMO_MODULES = ["wake", "rec", "threshold", "start"]
 
 # 识别各阶段: (起始进度, 结束进度, 预估秒数, 描述)
 RUN_STAGES = {
@@ -314,6 +394,17 @@ RUN_STAGES = {
     "rec":  (0.30, 0.55, 1.5, "提取识别音频声纹"),
     "asr":  (0.55, 0.95, 5.0, "ASR 语音转写"),
 }
+
+# 长任务各阶段: (起始进度, 结束进度)
+TASK_PHASES = {
+    "scan":  (0.00, 0.05),
+    "train": (0.05, 0.65),
+    "dev":   (0.65, 0.95),
+    "infer": (0.05, 0.95),
+    "done":  (1.00, 1.00),
+}
+
+SPINNER = "-\\|/"
 
 
 # ---------------------------------------------------------------
@@ -346,13 +437,11 @@ def read_key_timeout(sec):
 
 
 # ---------------------------------------------------------------
-# 模型加载（core 执行，日志走 stdout → 管道 → 原窗口）
+# 模型加载（models 执行，日志走 stdout → 管道 → 原窗口）
 # ---------------------------------------------------------------
 def load_models_in_background():
     def run():
         hub.load(log=lambda m: print(m, flush=True))
-        if not hub.ready():
-            state.message = "模型加载失败，详见原窗口日志"
 
     threading.Thread(target=run, daemon=True).start()
 
@@ -362,24 +451,63 @@ def models_ready():
 
 
 # ---------------------------------------------------------------
-# 主界面渲染
+# 模型加载页（就绪前唯一界面）
 # ---------------------------------------------------------------
-def status_mark(s):
-    marks = {"等待": (C_DIM, "[  ]"), "加载中": (C_WARN, "[~ ]"),
-             "就绪": (C_OK, "[OK]"), "失败": (C_ERR, "[X ]")}
-    color, mark = marks.get(s, (C_DIM, "[??]"))
-    return f"{color}{mark}{C_RESET} {s}"
+def draw_loading(frame):
+    pct = load_progress()
+    spin = SPINNER[frame % len(SPINNER)]
+    rows = ["", "", ""]
+    title = WINDOW_TITLE
+    rows.append(" " * max(0, (WIN_COLS - disp_width(title)) // 2)
+                + f"{C_TITLE}{title}{C_RESET}")
+    rows.append("")
+    bar = f"{prog_bar(pct, 60)} {int(pct * 100):3d}%"
+    rows.append(" " * max(0, (WIN_COLS - 66) // 2) + bar)
+    rows.append("")
+    for key, label in (("wespeaker", "声纹模型"), ("funasr", "ASR 模型")):
+        st = model_status[key]
+        mark = {"就绪": f"{C_OK}[OK]{C_RESET}", "失败": f"{C_ERR}[X]{C_RESET}"}.get(
+            st, f"{C_SEL}{spin}{C_RESET}" if st == "加载中" else "  ")
+        line = f"{mark} {label}: {st}"
+        rows.append(" " * max(0, (WIN_COLS - 24) // 2) + line)
+    if load_failed():
+        rows.append("")
+        rows.append(" " * max(0, (WIN_COLS - 40) // 2)
+                    + f"{C_ERR}模型加载失败，详见原窗口日志{C_RESET}")
+        rows.append(" " * max(0, (WIN_COLS - 40) // 2)
+                    + f"{C_DIM}Enter 仍要进入  ESC 退出{C_RESET}")
+    render(rows)
 
 
+# ---------------------------------------------------------------
+# 模块栏
+# ---------------------------------------------------------------
+def module_bar_rows():
+    """顶部模块栏（仅左右竖线，无上下框）：启用模块双竖线+亮色"""
+    tabs = []
+    for i, name in enumerate(MODULES):
+        active = (i == state.module)
+        focused = active and state.layer == "bar"
+        v = "║" if active else "│"
+        color = C_SEL if focused else (C_TITLE if active else C_DIM)
+        inner = fit(f" {i + 1} {name} ", 20)
+        tabs.append([f"{color}{v}{C_RESET}{inner}{color}{v}{C_RESET}"])
+    rows = tabs[0]
+    for t in tabs[1:]:
+        rows = hcat(rows, t, gap=2)
+    return rows
+
+
+# ---------------------------------------------------------------
+# 基础演示页
+# ---------------------------------------------------------------
 def audio_box(title, path, selected):
-    """音频模块：单行显示路径，超长中间省略"""
+    """音频选择盒：单行显示路径，超长中间省略"""
     if path:
         file_line = truncate_middle(path, 40)
     else:
         file_line = f"{C_DIM}(未选择){C_RESET}"
-    lines = [file_line,
-             f"{C_DIM}回车: 键入路径  Ctrl+回车: Explorer{C_RESET}"]
-    return make_box(title, lines, 45, selected)
+    return make_box(title, [file_line], 45, selected)
 
 
 def result_box_lines():
@@ -399,124 +527,77 @@ def result_box_lines():
     return [f"{C_DIM}尚未开始识别{C_RESET}"]
 
 
-def main_signature():
-    """主界面动态内容签名：变化时才重绘，避免闪烁"""
-    parts = [
-        model_status["wespeaker"], model_status["funasr"],
-        str(state.focus), f"{state.threshold:.2f}",
-        state.wake_path, state.audio_path, state.message,
-        str(state.is_running), state.run_stage,
-        "".join(strip_ansi(l) for l in state.result_lines),
-    ]
-    if state.is_running:
-        # 运行中按进度条格数与 0.1s 粒度刷新
-        parts.append(str(int(run_progress() * 56)))
-        parts.append(f"{time.time() - state.run_t0:.1f}")
-    return "|".join(parts)
-
-
-def draw_main():
+def demo_rows():
     rows = []
+    sel = state.layer == "content"
 
     # 唤醒音频 + 识别音频（并排）
-    wake = audio_box("唤醒音频", state.wake_path, state.focus == 0)
-    rec = audio_box("识别音频", state.audio_path, state.focus == 1)
+    wake = audio_box("唤醒音频", state.wake_path, sel and state.demo_focus == 0)
+    rec = audio_box("识别音频", state.audio_path, sel and state.demo_focus == 1)
     rows += hcat(wake, rec)
     rows.append("")
 
-    # 右列：拒识阈值 + 开始识别
-    right_w = CONTENT_W - LEFT_W - 2
+    # 拒识阈值 + 开始识别（并排）
     th = [f"余弦相似度阈值: {C_TITLE}{state.threshold:.2f}{C_RESET}  {prog_bar(state.threshold, 20)}",
-          f"{C_DIM}相似度 ≥ 阈值判为目标说话人，否则拒识。←→ 微调 ±0.05{C_RESET}"]
-    right_rows = make_box("拒识阈值", th, right_w, state.focus == 2)
-    right_rows.append(" " * right_w)
-    label = ">>> 开 始 识 别 <<<" if state.focus == 3 else "开 始 识 别"
-    pad = max(0, (right_w - 4 - disp_width(label)) // 2)
-    right_rows += make_box("", [" " * pad + label], right_w, state.focus == 3)
-
-    # 左列：模型状态（高度与右列匹配）
-    pct = load_progress()
-    ms = [f"{prog_bar(pct, 16)} {int(pct * 100):3d}%",
-          "",
-          f"声纹: {status_mark(model_status['wespeaker'])}",
-          f"ASR:  {status_mark(model_status['funasr'])}"]
-    left_box = make_box("模型状态", ms, LEFT_W, False,
-                        min_height=len(right_rows) - 2)
-    rows += hcat(left_box, right_rows)
+          f"{C_DIM}相似度 ≥ 阈值判为目标说话人，否则拒识{C_RESET}"]
+    th_box = make_box("拒识阈值", th, 56, sel and state.demo_focus == 2)
+    label = ">>> 开 始 识 别 <<<" if state.demo_focus == 3 else "开 始 识 别"
+    pad = max(0, (34 - 4 - disp_width(label)) // 2)
+    st_box = make_box("", [" " * pad + label], 34, sel and state.demo_focus == 3,
+                      min_height=2)
+    rows += hcat(th_box, st_box)
     rows.append("")
 
     # 识别结果（内联，运行中实时刷新）
     rows += make_box("识别结果", result_box_lines(), CONTENT_W,
-                     state.is_running, min_height=8)
-
-    # 底部提示
-    rows.append("")
-    if state.message:
-        rows.append(f" {C_WARN}{state.message}{C_RESET}")
-    rows.append(f" {C_DIM}↑↓ 切换模块  ←→ 调整  回车 键入路径  Ctrl+回车 Explorer  ESC 退出{C_RESET}")
-    render(rows)
+                     state.is_running, min_height=9)
+    return rows
 
 
 # ---------------------------------------------------------------
-# 音频路径选择
+# 文本输入 / 文件浏览
 # ---------------------------------------------------------------
-def pick_path_manual(target):
-    """回车：键入路径"""
-    title = "唤醒音频" if target == "wake" else "识别音频"
-    lines = make_box(f"手动键入{title}路径", [
-        "请输入音频文件的完整路径（支持 WAV/MP3/FLAC），",
-        "直接回车取消。",
-        "",
-    ], CONTENT_W, True)
+def edit_text(title, hint_lines, current=""):
+    """全屏输入界面：返回输入文本（空 = 取消）"""
+    lines = make_box(title, hint_lines + [""], CONTENT_W, True)
     render(lines)
-    _emit_raw("  路径 > ")
+    _emit_raw(f"  当前值: {current}\n  新值 > " if current else "  > ")
     _show_cursor(True)
     try:
-        path = input().strip().strip('"').strip("'")
+        val = input().strip().strip('"').strip("'")
     except (EOFError, KeyboardInterrupt):
-        path = ""
+        val = ""
     _show_cursor(False)
-    if not path:
-        return
-    if os.path.isfile(path):
-        _set_audio_path(target, path)
-    else:
-        state.message = f"文件不存在: {truncate(path, 60)}"
+    return val
 
 
-def pick_path_explorer(target):
-    """Ctrl+回车：通过系统 Explorer 对话框选择"""
+def pick_explorer(kind):
+    """Ctrl+Enter：系统对话框选文件/目录"""
     try:
         import tkinter as tk
         from tkinter import filedialog
         root = tk.Tk()
         root.withdraw()
         root.attributes("-topmost", True)
-        path = filedialog.askopenfilename(
-            title="选择音频文件",
-            filetypes=[("音频文件", "*.wav *.mp3 *.flac"), ("所有文件", "*.*")],
-        )
+        if kind == "file":
+            path = filedialog.askopenfilename(
+                title="选择文件",
+                filetypes=[("音频/文本", "*.wav *.mp3 *.flac *.txt"),
+                           ("所有文件", "*.*")])
+        else:
+            path = filedialog.askdirectory(title="选择目录")
         root.destroy()
     except ImportError:
-        state.message = "当前环境无 tkinter，请改用手动键入路径"
-        return
+        state.message = "当前环境无 tkinter，请改用手动键入"
+        return ""
     except Exception as e:
-        state.message = f"打开文件对话框失败: {e}"
-        return
-    if path:
-        _set_audio_path(target, os.path.normpath(path))
-
-
-def _set_audio_path(target, path):
-    if target == "wake":
-        state.wake_path = path
-    else:
-        state.audio_path = path
-    state.message = f"已选择: {os.path.basename(path)}"
+        state.message = f"打开对话框失败: {e}"
+        return ""
+    return os.path.normpath(path) if path else ""
 
 
 # ---------------------------------------------------------------
-# 识别流程（core.recognize 执行，结果内联刷新到主界面）
+# 基础演示：识别流程（demo.recognize 执行，结果内联刷新）
 # ---------------------------------------------------------------
 def _set_stage(name):
     state.run_stage = name
@@ -537,9 +618,6 @@ def start_recognition():
     """启动识别（非阻塞，主界面结果盒实时刷新）"""
     if state.is_running:
         state.message = "识别进行中，请稍候"
-        return
-    if not models_ready():
-        state.message = "模型尚未加载完成，请稍候"
         return
     if not state.wake_path or not os.path.isfile(state.wake_path):
         state.message = "请先选择唤醒音频"
@@ -565,6 +643,8 @@ def start_recognition():
             lines = [
                 f"唤醒: {truncate_middle(state.wake_path, 76)}",
                 f"识别: {truncate_middle(state.audio_path, 76)}",
+                f"{C_DIM}等价命令: python demo.py --wake \"{state.wake_path}\" "
+                f"--rec \"{state.audio_path}\" --threshold {state.threshold:.2f}{C_RESET}",
                 "",
                 f"声纹相似度: {C_TITLE}{sim:.4f}{C_RESET}   阈值: {state.threshold:.2f}",
             ]
@@ -588,6 +668,591 @@ def start_recognition():
 
 
 # ---------------------------------------------------------------
+# 长任务（构建/评估）：子进程 + [PROGRESS] 解析
+# ---------------------------------------------------------------
+def start_task(kind, cmd):
+    """派生子进程执行等价命令行，线程读取 stdout 驱动进度"""
+    if state.task and not state.task["done"]:
+        state.message = "任务进行中，请稍候（ESC 中止）"
+        return
+
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    import subprocess
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="replace",
+        cwd=PROJECT_ROOT, env=env)
+    state.task = {
+        "kind": kind, "proc": proc, "t0": time.time(),
+        "progress": {"phase": "scan" if kind == "build" else "infer",
+                     "done": 0, "total": 0},
+        "logs": [], "done": False, "rc": None,
+    }
+    state.task_acked = False
+    print(f"[UI] 执行: {' '.join(cmd)}", flush=True)
+
+    def work():
+        for line in proc.stdout:
+            line = line.rstrip("\n")
+            print(line, flush=True)  # 日志回传原窗口
+            if line.startswith(PROGRESS_PREFIX):
+                try:
+                    state.task["progress"] = json.loads(
+                        line[len(PROGRESS_PREFIX):])
+                except ValueError:
+                    pass
+            elif line.strip():
+                state.task["logs"].append(line)
+                state.task["logs"] = state.task["logs"][-5:]
+        proc.wait()
+        state.task["rc"] = proc.returncode
+        state.task["done"] = True
+        if kind == "build":
+            refresh_datasets()
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+def cancel_task():
+    t = state.task
+    if t and not t["done"]:
+        t["proc"].terminate()
+        t["logs"].append("[UI] 已中止")
+        state.message = "任务已中止"
+
+
+def task_running():
+    return state.task is not None and not state.task["done"]
+
+
+def task_progress():
+    """长任务总进度 [0,1]：按阶段映射 + 阶段内 done/total 插值"""
+    p = state.task["progress"]
+    lo, hi = TASK_PHASES.get(p.get("phase"), (0.0, 0.05))
+    total = p.get("total") or 0
+    frac = (p.get("done", 0) / total) if total else 0.0
+    return lo + (hi - lo) * min(1.0, frac)
+
+
+def task_box_lines():
+    """长任务可视化：进度条 + 阶段 + ETA + 日志尾部 / 完成后摘要"""
+    t = state.task
+    if t is None:
+        return [f"{C_DIM}尚未运行{C_RESET}"]
+    if not t["done"]:
+        p = t["progress"]
+        pct = task_progress()
+        elapsed = time.time() - t["t0"]
+        done, total = p.get("done", 0), p.get("total", 0)
+        eta = (elapsed * (total - done) / done) if done else 0
+        lines = [
+            f"{prog_bar(pct, 48)} {int(pct * 100):3d}%",
+            f"阶段: {C_SEL}{p.get('phase', '?')}{C_RESET}   "
+            f"{done}/{total or '?'}   已用 {elapsed:.0f}s"
+            + (f"   预计剩余 {eta:.0f}s" if done else ""),
+            "",
+        ]
+        lines += [f"{C_DIM}{l}{C_RESET}" for l in t["logs"][-3:]]
+        return lines
+
+    ok = t["rc"] == 0
+    head = (f"{C_OK}完成{C_RESET}" if ok
+            else f"{C_ERR}失败（退出码 {t['rc']}）{C_RESET}")
+    lines = [f"{head}   耗时 {time.time() - t['t0']:.0f}s", ""]
+    lines += task_summary(t)
+    return lines
+
+
+def task_summary(t):
+    """任务完成后的结果摘要（从元数据/评估结果文件读取）"""
+    if t["rc"] != 0:
+        return [f"{C_ERR}{l}{C_RESET}" for l in t["logs"][-4:]]
+    out = []
+    if t["kind"] == "build":
+        entries = ds.list_datasets()
+        if not entries:
+            return ["（未找到新数据集）"]
+        meta = entries[0]["meta"] or {}
+        out.append(f"数据集: {C_TITLE}{entries[0]['name']}{C_RESET}")
+        for split, d in meta.get("splits", {}).items():
+            out.append(f"{split}: {d['total']} 条 (正 {d['positive']} / 拒 {d['rejection']})"
+                       f"  重叠 {d['overlap_pct']:.0%}")
+    else:
+        p = t["progress"]
+        if p.get("phase") == "done" and "cer" in p:
+            out.append(f"最优阈值 {p.get('best_threshold'):.2f}: "
+                       f"CER {C_TITLE}{p['cer']:.2%}{C_RESET}  "
+                       f"拒识率 {C_TITLE}{p['rr']:.2%}{C_RESET}  "
+                       f"RTF {p.get('rtf')}")
+            out.append(f"结果文件: evals/{p.get('output', '')}")
+        out.append(f"{C_DIM}明细与全阈值表见数据集 evals/ 目录{C_RESET}")
+    return out
+
+
+# ---------------------------------------------------------------
+# 数据集搭建模块（单页）
+# ---------------------------------------------------------------
+DATA_LEFT_W = 56          # 左列宽（入口 + 信息框）
+DATA_RIGHT_W = CONTENT_W - DATA_LEFT_W - 2   # 右侧数据集列表宽
+INFO_H = 14               # 信息框内容行数
+
+
+def refresh_datasets():
+    state.ds_entries = ds.list_datasets()
+    if state.ds_sel >= len(state.ds_entries):
+        state.ds_sel = max(0, len(state.ds_entries) - 1)
+
+
+def _num(val, default=0.0):
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def param_visual(key, val):
+    """有固定量程的比值参数：进度条 + 当前值"""
+    lo, hi, _ = BUILD_ADJUST[key]
+    v = _num(val, lo)
+    frac = (v - lo) / max(1e-9, hi - lo)
+    return f"{prog_bar(frac, 14)} {val}"
+
+
+def build_param_lines():
+    """信息框内容：构建参数列表（比值项带进度条）"""
+    lines = []
+    for i, (key, label, _, kind) in enumerate(BUILD_PARAMS):
+        focused = state.zone == "param" and state.entry == 0 \
+            and state.param_idx == i
+        mark = f"{C_SEL}>{C_RESET} " if focused else "  "
+        val = state.build_vals[key]
+        disp = param_visual(key, val) if key in BUILD_BAR else val
+        if focused:
+            disp = f"{C_SEL}{disp}{C_RESET}"
+        lines.append(mark + truncate(f"{label}: {disp}", 50))
+    return lines
+
+
+def eval_param_lines():
+    """信息框内容：评估参数列表"""
+    cur = state.ds_entries[state.ds_sel] if state.ds_entries else None
+    ds_name = cur["name"] if cur else "（无可用数据集）"
+    rows = [("目标数据集", ds_name, None),
+            ("划分", state.eval_split, 0),
+            ("阈值扫描", state.eval_sweep, 1),
+            ("条数限制(0=全部)", state.eval_limit, 2),
+            ("逐样本明细", "是" if state.eval_detail else "否", 3)]
+    lines = []
+    for label, val, idx in rows:
+        focused = (idx is not None and state.zone == "param"
+                   and state.entry == 1 and state.param_idx == idx)
+        mark = f"{C_SEL}>{C_RESET} " if focused else "  "
+        disp = f"{C_SEL}{val}{C_RESET}" if focused else val
+        lines.append(mark + truncate(f"{label}: {disp}", 50))
+    return lines
+
+
+def dataset_detail_lines(entry):
+    """信息框内容：数据集详细信息（来自 metadata + 最近评估）"""
+    meta = entry["meta"] or {}
+    lines = [f"{C_TITLE}{entry['name']}{C_RESET}",
+             f"创建: {meta.get('created_at', '?')}   别名: {meta.get('alias', '?')}"]
+    for split, d in meta.get("splits", {}).items():
+        s = (f"{split}: {d['total']} 条 (正 {d['positive']} / 拒 {d['rejection']})"
+             f"  重叠 {d['overlap_pct']:.0%}")
+        if "low_snr_pct" in d:
+            s += f"  低SNR {d['low_snr_pct']:.0%}"
+        lines.append(s)
+    p = meta.get("params", {})
+    if p:
+        lines.append(f"{C_DIM}参数: seed={p.get('seed')} reject={p.get('reject_ratio')}"
+                     f" overlap={p.get('overlap_prob')} trim={p.get('trim')}{C_RESET}")
+    ev = entry.get("latest_eval")
+    if ev:
+        best = ev.get("best_threshold")
+        m = next((x for x in ev.get("metrics", [])
+                  if x.get("threshold") == best), None)
+        if m:
+            lines.append(f"最近评估: 阈值 {best}  CER {C_TITLE}{m['cer']:.1%}{C_RESET}"
+                         f"  RR {C_TITLE}{m['rr']:.1%}{C_RESET}"
+                         f"  RTF {ev.get('rtf')}")
+    else:
+        lines.append(f"{C_DIM}（尚未评估）{C_RESET}")
+    return lines
+
+
+def info_box_lines():
+    """信息框内容分派：任务视图 > 数据集详情 > 参数列表"""
+    if state.task is not None and (task_running() or not state.task_acked):
+        return task_box_lines()
+    if state.zone == "ds" and state.ds_entries:
+        return dataset_detail_lines(state.ds_entries[state.ds_sel])
+    if state.entry == 0:
+        return build_param_lines()
+    return eval_param_lines()
+
+
+def data_rows():
+    """数据集搭建单页：左上入口 + 右侧数据集竖列表 + 下方信息框"""
+    sel = state.layer == "content"
+
+    # 入口行（左列顶部，并排）
+    entries = []
+    for i, name in enumerate(["搭建数据集", "评估数据集"]):
+        focused = sel and state.zone == "entry" and state.entry == i
+        label = f">>> {name} <<<" if focused else name
+        pad = max(0, (27 - 4 - disp_width(label)) // 2)
+        entries.append(make_box("", [" " * pad + label], 27, focused))
+    entry_rows = hcat(entries[0], entries[1], gap=2)
+
+    # 信息框（左列下方）
+    info_title = "信息"
+    if state.task is not None and (task_running() or not state.task_acked):
+        info_title = "运行状态"
+    elif state.zone == "ds":
+        info_title = "数据集详情"
+    elif state.entry == 0:
+        info_title = "构建参数"
+    else:
+        info_title = "评估参数"
+    info_rows = make_box(info_title, info_box_lines(), DATA_LEFT_W,
+                         sel and state.zone == "param", min_height=INFO_H)
+
+    left = vcat(entry_rows, [" " * DATA_LEFT_W], info_rows)
+
+    # 右侧：数据集竖列表（只显示 日期_别名）
+    lst = []
+    for i, e in enumerate(state.ds_entries[:INFO_H]):
+        focused = sel and state.zone == "ds" and state.ds_sel == i
+        mark = f"{C_SEL}>{C_RESET}" if focused else " "
+        name = f"{C_SEL}{e['name']}{C_RESET}" if focused else e["name"]
+        lst.append(f"{mark} {name}")
+    if not state.ds_entries:
+        lst.append(f"{C_DIM}（暂无数据集）{C_RESET}")
+    right = make_box("数据集", lst, DATA_RIGHT_W,
+                     sel and state.zone == "ds", min_height=len(left) - 2)
+
+    return hcat(left, right)
+
+
+# ---------------------------------------------------------------
+# 主界面渲染
+# ---------------------------------------------------------------
+def main_signature():
+    """动态内容签名：变化时才重绘，避免闪烁"""
+    parts = [
+        state.layer, str(state.module), state.message,
+        str(state.demo_focus), f"{state.threshold:.2f}",
+        state.wake_path, state.audio_path,
+        str(state.is_running), state.run_stage,
+        "".join(strip_ansi(l) for l in state.result_lines),
+        state.zone, str(state.entry), str(state.param_idx), str(state.ds_sel),
+        json.dumps(state.build_vals, sort_keys=True),
+        state.eval_split, state.eval_sweep, state.eval_limit,
+        str(state.eval_detail), str(state.task_acked),
+        "|".join(e["name"] for e in state.ds_entries),
+    ]
+    if state.is_running:
+        parts.append(str(int(run_progress() * 56)))
+        parts.append(f"{time.time() - state.run_t0:.1f}")
+    if state.task:
+        t = state.task
+        parts += [json.dumps(t["progress"], sort_keys=True),
+                  str(t["done"]), "|".join(t["logs"])]
+        if not t["done"]:
+            parts.append(f"{time.time() - t['t0']:.0f}")
+    return "|".join(parts)
+
+
+def hint_line():
+    if state.layer == "bar":
+        return f" {C_DIM}←→ 切换模块  Enter 进入  ESC 退出{C_RESET}"
+    if state.module == 0:
+        return (f" {C_DIM}↑↓ 切换  ←→ 调整  Enter 选择/开始  "
+                f"Ctrl+Enter 浏览  ESC 返回{C_RESET}")
+    if state.zone == "entry":
+        return f" {C_DIM}←→ 切换入口/数据集  ↓ 调整参数  Enter 运行  ESC 返回{C_RESET}"
+    if state.zone == "param":
+        return (f" {C_DIM}↑↓ 移动  ←→ 调整  Enter 修改文本项  "
+                f"Ctrl+Enter 浏览  ESC 返回入口{C_RESET}")
+    return f" {C_DIM}↑↓ 选择数据集  ← 返回入口  ESC 返回{C_RESET}"
+
+
+def draw():
+    rows = module_bar_rows()
+    rows.append("")
+    if state.module == 0:
+        rows += demo_rows()
+    else:
+        rows += data_rows()
+    rows.append("")
+    if state.message:
+        rows.append(f" {C_WARN}{state.message}{C_RESET}")
+    rows.append(hint_line())
+    render(rows)
+
+
+# ---------------------------------------------------------------
+# 按键处理
+# ---------------------------------------------------------------
+def handle_bar_key(key):
+    if key == "LEFT":
+        state.module = (state.module - 1) % len(MODULES)
+    elif key == "RIGHT":
+        state.module = (state.module + 1) % len(MODULES)
+    elif key in ("DOWN", "ENTER"):
+        state.layer = "content"
+        if state.module == 1:
+            refresh_datasets()
+    elif key in ("1", "2"):
+        state.module = int(key) - 1
+        state.layer = "content"
+        if state.module == 1:
+            refresh_datasets()
+    elif key == "ESC":
+        return "exit"
+    state.message = ""
+    return None
+
+
+def handle_demo_key(key):
+    if key == "UP":
+        state.demo_focus = (state.demo_focus - 1) % len(DEMO_MODULES)
+    elif key == "DOWN":
+        state.demo_focus = (state.demo_focus + 1) % len(DEMO_MODULES)
+    elif key in ("LEFT", "RIGHT"):
+        mod = DEMO_MODULES[state.demo_focus]
+        if mod == "threshold":
+            delta = 0.05 if key == "RIGHT" else -0.05
+            state.threshold = round(min(1.0, max(0.0, state.threshold + delta)), 2)
+        elif mod in ("wake", "rec"):
+            state.demo_focus = 1 - state.demo_focus  # 左右互换
+    elif key == "ENTER":
+        mod = DEMO_MODULES[state.demo_focus]
+        if mod in ("wake", "rec"):
+            title = "唤醒音频" if mod == "wake" else "识别音频"
+            cur = state.wake_path if mod == "wake" else state.audio_path
+            val = edit_text(f"键入{title}路径",
+                            ["支持 WAV/MP3/FLAC，直接 Enter 取消。"], cur)
+            if val:
+                if os.path.isfile(val):
+                    _set_audio_path(mod, val)
+                else:
+                    state.message = f"文件不存在: {truncate(val, 60)}"
+            return "redraw"
+        elif mod == "start":
+            start_recognition()
+    elif key == "CTRL_ENTER":
+        mod = DEMO_MODULES[state.demo_focus]
+        if mod in ("wake", "rec"):
+            path = pick_explorer("file")
+            if path:
+                _set_audio_path(mod, path)
+            return "redraw"
+    elif key == "ESC":
+        state.layer = "bar"
+    return None
+
+
+def _set_audio_path(target, path):
+    if target == "wake":
+        state.wake_path = path
+    else:
+        state.audio_path = path
+    state.message = f"已选择: {os.path.basename(path)}"
+
+
+def _ack_task():
+    """任意选择变化视为已查看任务结果"""
+    if state.task and state.task["done"]:
+        state.task_acked = True
+
+
+def handle_data_key(key):
+    """数据集搭建模块：zone=entry/param/ds"""
+    if task_running():
+        if key == "ESC":
+            cancel_task()
+        return None  # 运行中锁定其它操作
+
+    if key == "ESC":
+        _ack_task()
+        if state.zone == "entry":
+            state.layer = "bar"
+        else:
+            state.zone = "entry"
+        return None
+
+    if state.zone == "entry":
+        if key == "LEFT":
+            state.entry = 0
+            _ack_task()
+        elif key == "RIGHT":
+            if state.entry == 0:
+                state.entry = 1
+            elif state.ds_entries:
+                state.zone = "ds"  # 评估入口再右移 → 数据集列表
+            _ack_task()
+        elif key == "DOWN":
+            state.zone = "param"
+            state.param_idx = 0
+        elif key == "ENTER":
+            if state.entry == 0:
+                launch_build()
+            else:
+                launch_eval()
+    elif state.zone == "param":
+        params = BUILD_PARAMS if state.entry == 0 else EVAL_PARAMS
+        n = len(params)
+        if key == "UP":
+            state.param_idx -= 1
+            if state.param_idx < 0:
+                state.zone = "entry"
+                state.param_idx = 0
+        elif key == "DOWN":
+            state.param_idx += 1
+            if state.param_idx >= n:
+                state.param_idx = 0
+                if state.entry == 0:
+                    state.entry = 1
+                    state.zone = "entry"
+                else:
+                    state.zone = "ds"
+        elif key in ("LEFT", "RIGHT"):
+            adjust_param(-1 if key == "LEFT" else 1)
+        elif key == "ENTER":
+            return edit_param()
+        elif key == "CTRL_ENTER":
+            return browse_param()
+    elif state.zone == "ds":
+        if key == "UP":
+            if state.ds_sel > 0:
+                state.ds_sel -= 1
+            else:
+                state.zone = "entry"
+                state.entry = 1
+            _ack_task()
+        elif key == "DOWN":
+            if state.ds_sel < len(state.ds_entries) - 1:
+                state.ds_sel += 1
+            _ack_task()
+        elif key == "LEFT":
+            state.zone = "entry"
+    state.message = ""
+    return None
+
+
+def adjust_param(delta):
+    """←→ 可视化调节数值/开关参数"""
+    if state.entry == 0:
+        key = BUILD_PARAMS[state.param_idx][0]
+        if key not in BUILD_ADJUST:
+            return
+        lo, hi, step = BUILD_ADJUST[key]
+        v = _num(state.build_vals[key], lo) + delta * step
+        v = max(lo, v)
+        if hi is not None:
+            v = min(hi, v)
+        state.build_vals[key] = (f"{v:.2f}" if isinstance(step, float)
+                                 else str(int(v)))
+    else:
+        item = EVAL_PARAMS[state.param_idx][0]
+        if item == "split":
+            state.eval_split = "train" if state.eval_split == "dev" else "dev"
+        elif item == "detail":
+            state.eval_detail = not state.eval_detail
+        elif item == "limit":
+            v = max(0, int(_num(state.eval_limit)) + delta * 50)
+            state.eval_limit = str(v)
+
+
+def edit_param():
+    """Enter 修改文本型参数"""
+    if state.entry == 0:
+        key, label, _, kind = BUILD_PARAMS[state.param_idx]
+        val = edit_text(f"修改 {label}", ["直接 Enter 取消。"],
+                        state.build_vals[key])
+        if val:
+            state.build_vals[key] = val
+        return "redraw"
+    item, label, _ = EVAL_PARAMS[state.param_idx]
+    if item == "sweep":
+        val = edit_text("修改 阈值扫描", ["格式 lo:hi:step，直接 Enter 取消。"],
+                        state.eval_sweep)
+        if val:
+            state.eval_sweep = val
+        return "redraw"
+    if item == "limit":
+        val = edit_text("修改 条数限制", ["0 = 全部，直接 Enter 取消。"],
+                        state.eval_limit)
+        if val:
+            state.eval_limit = val
+        return "redraw"
+    adjust_param(1)  # toggle 项 Enter = 翻转
+    return None
+
+
+def browse_param():
+    """Ctrl+Enter 浏览选择路径"""
+    if state.entry != 0:
+        return None
+    key, label, _, kind = BUILD_PARAMS[state.param_idx]
+    if kind not in ("dir", "file"):
+        return None
+    path = pick_explorer(kind)
+    if path:
+        state.build_vals[key] = ds.rel_path(path)
+    return "redraw"
+
+
+def launch_build():
+    v = state.build_vals
+    cmd = [sys.executable, "-u",
+           os.path.join(PROJECT_ROOT, "build_dataset.py"),
+           "--alias", v["alias"],
+           "--clean-dir", v["clean_dir"],
+           "--noise-dir", v["noise_dir"],
+           "--rir-dir", v["rir_dir"],
+           "--num-train", str(int(_num(v["num_train"], 2000))),
+           "--num-dev", str(int(_num(v["num_dev"], 200))),
+           "--reject-ratio", f"{_num(v['reject_ratio'], 0.3)}",
+           "--overlap-prob", f"{_num(v['overlap_prob'], 0.4)}",
+           "--seed", str(int(_num(v["seed"], 42))),
+           "--progress"]
+    if v["transcript"]:
+        cmd += ["--transcript", v["transcript"]]
+    start_task("build", cmd)
+
+
+def launch_eval():
+    if not state.ds_entries:
+        state.message = "无可用数据集，请先搭建"
+        return
+    name = state.ds_entries[state.ds_sel]["name"]
+    cmd = [sys.executable, "-u",
+           os.path.join(PROJECT_ROOT, "evaluate.py"),
+           "--dataset", name,
+           "--split", state.eval_split,
+           "--sweep", state.eval_sweep,
+           "--progress"]
+    limit = int(_num(state.eval_limit))
+    if limit > 0:
+        cmd += ["--limit", str(limit)]
+    if state.eval_detail:
+        cmd += ["--detail"]
+    start_task("eval", cmd)
+
+
+def handle_key(key):
+    """返回 'exit' / 'redraw' / None"""
+    if state.layer == "bar":
+        return handle_bar_key(key)
+    if state.module == 0:
+        return handle_demo_key(key)
+    return handle_data_key(key)
+
+
+# ---------------------------------------------------------------
 # UI 主循环（运行于独立子窗口）
 # ---------------------------------------------------------------
 def run_ui():
@@ -596,13 +1261,29 @@ def run_ui():
 
     last_sig = ""
     last_fix = 0.0
+    frame = 0
 
     try:
         while True:
-            # 内容变化时才重绘（加载/识别进度实时推进）
+            if state.load_gate:
+                # 模型加载页：仅进度与动画
+                if hub.ready():
+                    state.load_gate = False
+                    last_sig = ""
+                    continue
+                draw_loading(frame)
+                frame += 1
+                key = read_key_timeout(0.15)
+                if key == "ESC":
+                    break
+                if key == "ENTER" and load_failed():
+                    state.load_gate = False
+                continue
+
+            # 内容变化时才重绘（识别/任务进度实时推进）
             sig = main_signature()
             if sig != last_sig:
-                draw_main()
+                draw()
                 last_sig = sig
 
             key = read_key_timeout(0.2)
@@ -615,33 +1296,11 @@ def run_ui():
             if not key:
                 continue
 
-            if key == "UP":
-                state.focus = (state.focus - 1) % len(MODULES)
-                state.message = ""
-            elif key == "DOWN":
-                state.focus = (state.focus + 1) % len(MODULES)
-                state.message = ""
-            elif key in ("LEFT", "RIGHT"):
-                mod = MODULES[state.focus]
-                if mod == "threshold":
-                    delta = 0.05 if key == "RIGHT" else -0.05
-                    state.threshold = round(min(1.0, max(0.0, state.threshold + delta)), 2)
-                elif mod in ("wake", "rec"):
-                    state.focus = 1 - state.focus  # 左右互换
-            elif key == "ENTER":
-                mod = MODULES[state.focus]
-                if mod in ("wake", "rec"):
-                    pick_path_manual(mod)
-                    last_sig = ""  # 键入界面清过屏，强制重绘主界面
-                elif mod == "start":
-                    start_recognition()
-            elif key == "CTRL_ENTER":
-                mod = MODULES[state.focus]
-                if mod in ("wake", "rec"):
-                    pick_path_explorer(mod)
-                    last_sig = ""  # Explorer 返回后强制重绘主界面
-            elif key == "ESC":
+            action = handle_key(key)
+            if action == "exit":
                 break
+            if action == "redraw":
+                last_sig = ""  # 输入界面清过屏，强制重绘主界面
     finally:
         _show_cursor(True)
         _clear_screen()

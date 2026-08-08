@@ -24,7 +24,11 @@
     <EnableUnmanagedDebugging>false</EnableUnmanagedDebugging>
   </PropertyGroup>
   <ItemGroup>
-    <Compile Include="core.py" />
+    <Compile Include="models.py" />
+    <Compile Include="demo.py" />
+    <Compile Include="datasets.py" />
+    <Compile Include="build_dataset.py" />
+    <Compile Include="evaluate.py" />
     <Compile Include="JigBas.py" />
     <Compile Include="verify_env.py" />
     <Compile Include="ui.py" />

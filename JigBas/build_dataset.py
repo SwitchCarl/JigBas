@@ -22,10 +22,11 @@
 #   --transcript 显式指定。
 #
 # 用法：
-#   python build_dataset.py --clean-dir D:\corpus\data_aishell\wav\train \
-#         --noise-dir D:\corpus\musan\noise --output Dataset \
-#         --num-train 2000 --num-dev 200
-#   python build_dataset.py --stats    # 统计已生成数据集（默认输出目录）
+#   python build_dataset.py --alias baseline --num-train 2000 --num-dev 200
+#   python build_dataset.py --stats --dataset latest
+#   python build_dataset.py --progress   # 输出 [PROGRESS] 结构化行（供 UI 解析）
+#
+# 输出：<数据集根>/<创建时间>_<别名>/（含 metadata.json，构建后自动生成）
 # ==============================================================
 
 import argparse
@@ -35,26 +36,29 @@ import math
 import os
 import re
 import sys
+import time
 
 import numpy as np
 import soundfile as sf
 
+import datasets as ds
+
 SAMPLE_RATE = 16000
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-# 默认产物目录：仓库外的 E:\Desktop\Jigbas\Temp\Dataset（体积大，不入库）
-DEFAULT_OUTPUT = os.path.normpath(
-    os.path.join(SCRIPT_DIR, "..", "..", "Temp", "Dataset"))
-# 默认语料路径（仓库内 Datasets/，不存在时由用户通过参数覆盖）
-DEFAULT_CLEAN_DIR = os.path.normpath(
-    os.path.join(SCRIPT_DIR, "..", "Datasets", "data_aishell", "wav", "train"))
-DEFAULT_NOISE_DIR = os.path.normpath(
-    os.path.join(SCRIPT_DIR, "..", "Datasets", "musan", "noise"))
-DEFAULT_RIR_DIR = os.path.normpath(
-    os.path.join(SCRIPT_DIR, "..", "Datasets", "sim_rir_8k"))
-DEFAULT_TRANSCRIPT = os.path.normpath(
-    os.path.join(SCRIPT_DIR, "..", "Datasets", "data_aishell",
-                 "transcript", "aishell_transcript_v0.8.txt"))
+# 默认路径均为相对项目根（JigBas/JigBas）的相对路径，运行时经 ds.resolve_path 解析
+DEFAULT_CLEAN_DIR = os.path.join("..", "Datasets", "data_aishell", "wav", "train")
+DEFAULT_NOISE_DIR = os.path.join("..", "Datasets", "musan", "noise")
+DEFAULT_RIR_DIR = os.path.join("..", "Datasets", "sim_rir_8k")
+DEFAULT_TRANSCRIPT = os.path.join("..", "Datasets", "data_aishell",
+                                  "transcript", "aishell_transcript_v0.8.txt")
+
+_PROGRESS_ENABLED = False
+
+
+def emit_progress(**kw):
+    """--progress 开启时输出结构化进度行（供 UI 解析，普通日志不受影响）"""
+    if _PROGRESS_ENABLED:
+        print(f"[PROGRESS] {json.dumps(kw, ensure_ascii=False)}", flush=True)
 
 # ---------------------------------------------------------------
 # 基础音频工具
@@ -420,11 +424,28 @@ def build(args):
     # 脚本内混用了 numpy Generator 风格 API（integers/standard_normal），
     # 必须用 np.random.default_rng，不能用 random.Random
     rng = np.random.default_rng(args.seed)
-    os.makedirs(args.output, exist_ok=True)
 
-    print(f"[扫描] 干净语料: {args.clean_dir}")
-    transcripts = load_transcripts(args.clean_dir, args.transcript)
-    speakers = scan_corpus(args.clean_dir, transcripts)
+    # 相对路径 → 绝对路径
+    clean_dir = ds.resolve_path(args.clean_dir)
+    noise_dir = ds.resolve_path(args.noise_dir)
+    rir_dir = ds.resolve_path(args.rir_dir)
+    transcript = ds.resolve_path(args.transcript) if args.transcript else None
+
+    # 输出目录：--output 显式指定；默认 <数据集根>/<时间>_<别名>/
+    if args.output:
+        out_dir = ds.resolve_path(args.output)
+        folder_name = os.path.basename(out_dir)
+        os.makedirs(out_dir, exist_ok=True)
+    else:
+        out_dir, folder_name = ds.new_dataset_folder(args.alias)
+    args.output = out_dir  # generate_sample / stats 均通过 args.output 取路径
+
+    print(f"[输出] 数据集目录: {out_dir}")
+    emit_progress(phase="scan", done=0, total=0)
+
+    print(f"[扫描] 干净语料: {clean_dir}")
+    transcripts = load_transcripts(clean_dir, transcript)
+    speakers = scan_corpus(clean_dir, transcripts)
     # 至少需要 2 个说话人才能构造拒识 / 重叠样本
     speakers = {s: u for s, u in speakers.items() if u}
     if len(speakers) < 2:
@@ -441,8 +462,8 @@ def build(args):
         print("       请用 --transcript 显式指定转写文件后重试。")
         sys.exit(1)
 
-    noise_paths = scan_audio_dir(args.noise_dir)
-    rir_paths = scan_audio_dir(args.rir_dir)
+    noise_paths = scan_audio_dir(noise_dir)
+    rir_paths = scan_audio_dir(rir_dir)
     print(f"[扫描] 噪声 {len(noise_paths)} 条，RIR {len(rir_paths)} 条")
     if not noise_paths:
         print("[警告] 未提供噪声库，将跳过加噪增强")
@@ -461,7 +482,7 @@ def build(args):
         if count <= 0:
             continue
         spk_ids = split_map[split]
-        manifest_path = os.path.join(args.output, f"{split}_manifest.jsonl")
+        manifest_path = os.path.join(out_dir, f"{split}_manifest.jsonl")
         made, idx = 0, 0
         with open(manifest_path, "w", encoding="utf-8") as mf:
             while made < count:
@@ -469,7 +490,7 @@ def build(args):
                 try:
                     rec = generate_sample(
                         idx, split, kind, speakers, spk_ids, rng,
-                        noise_paths, rir_paths, args.output,
+                        noise_paths, rir_paths, out_dir,
                         args.overlap_prob, args.trim)
                 except Exception as e:
                     print(f"[跳过] {split} #{idx} 生成失败: {e}")
@@ -482,48 +503,107 @@ def build(args):
                 made += 1
                 if made % 100 == 0:
                     print(f"[{split}] {made}/{count}")
+                    emit_progress(phase=split, done=made, total=count)
         print(f"[完成] {split}: {made} 条 -> {manifest_path}")
 
-    print(f"\n数据集已生成: {os.path.abspath(args.output)}")
-    print("下一步：python build_dataset.py --stats --output", args.output)
+    # 自动生成元数据（条目数 / 时长 / SNR / 重叠分布 + 构建参数）
+    splits = stats_dict(out_dir)
+    meta = {
+        "name": folder_name,
+        "alias": args.alias,
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "params": {
+            "clean_dir": args.clean_dir, "transcript": args.transcript,
+            "noise_dir": args.noise_dir, "rir_dir": args.rir_dir,
+            "num_train": args.num_train, "num_dev": args.num_dev,
+            "reject_ratio": args.reject_ratio,
+            "overlap_prob": args.overlap_prob,
+            "dev_speaker_ratio": args.dev_speaker_ratio,
+            "trim": args.trim, "seed": args.seed,
+        },
+        "splits": splits,
+    }
+    ds.write_metadata(out_dir, meta)
+    ds.update_latest(folder_name)
+    emit_progress(phase="done", done=1, total=1, folder=folder_name)
+
+    print(f"\n数据集已生成: {out_dir}")
+    print(f"元数据: {os.path.join(out_dir, ds.METADATA_FILE)}")
+    print_stats(out_dir)
+    print("下一步：python evaluate.py --dataset", folder_name)
 
 
 # ---------------------------------------------------------------
 # 统计
 # ---------------------------------------------------------------
-def stats(args):
+def _split_stats(rows):
+    pos = [r for r in rows if r["type"] == "positive"]
+    ovl = [r for r in rows if r["overlap_ratio"] > 0]
+    snr = [r["snr_db"] for r in rows if r["snr_db"] is not None]
+    dur = sum(r["duration"] for r in rows)
+    d = {
+        "total": len(rows),
+        "positive": len(pos),
+        "rejection": len(rows) - len(pos),
+        "duration_h": round(dur / 3600, 3),
+        "avg_duration_s": round(dur / max(1, len(rows)), 1),
+        "overlap_count": len(ovl),
+        "overlap_pct": round(len(ovl) / max(1, len(rows)), 3),
+        "missing_text": sum(1 for r in pos if not r["rec_text"]),
+    }
+    if snr:
+        d["snr_min"] = min(snr)
+        d["snr_max"] = max(snr)
+        d["low_snr_pct"] = round(sum(1 for s in snr if s < 0) / len(snr), 3)
+    return d
+
+
+def stats_dict(folder):
+    """读取 folder 下 train/dev manifest，返回 {split: 统计}（供元数据与打印共用）"""
+    out = {}
     for split in ("train", "dev"):
-        path = os.path.join(args.output, f"{split}_manifest.jsonl")
+        path = os.path.join(folder, f"{split}_manifest.jsonl")
         if not os.path.isfile(path):
             continue
         rows = [json.loads(l) for l in open(path, encoding="utf-8")]
-        pos = [r for r in rows if r["type"] == "positive"]
-        rej = [r for r in rows if r["type"] == "rejection"]
-        ovl = [r for r in rows if r["overlap_ratio"] > 0]
-        snr = [r["snr_db"] for r in rows if r["snr_db"] is not None]
-        dur = sum(r["duration"] for r in rows)
-        print(f"== {split}: 共 {len(rows)} 条 (正样本 {len(pos)}, 拒识 {len(rej)})")
-        print(f"   识别音频总时长 {dur/3600:.2f} h, 平均 {dur/max(1,len(rows)):.1f} s")
-        print(f"   含重叠语音 {len(ovl)} 条 ({100*len(ovl)/max(1,len(rows)):.0f}%)")
-        if snr:
-            print(f"   SNR 范围 [{min(snr)}, {max(snr)}] dB, "
-                  f"低信噪比(<0dB)占比 {100*sum(1 for s in snr if s < 0)/len(snr):.0f}%")
-        empty = sum(1 for r in pos if not r["rec_text"])
-        if empty:
-            print(f"   [注意] {empty} 条正样本缺少转写文本")
+        out[split] = _split_stats(rows)
+    return out
+
+
+def print_stats(folder):
+    for split, d in stats_dict(folder).items():
+        print(f"== {split}: 共 {d['total']} 条 (正样本 {d['positive']}, "
+              f"拒识 {d['rejection']})")
+        print(f"   识别音频总时长 {d['duration_h']} h, 平均 {d['avg_duration_s']} s")
+        print(f"   含重叠语音 {d['overlap_count']} 条 ({d['overlap_pct']:.0%})")
+        if "snr_min" in d:
+            print(f"   SNR 范围 [{d['snr_min']}, {d['snr_max']}] dB, "
+                  f"低信噪比(<0dB)占比 {d['low_snr_pct']:.0%}")
+        if d["missing_text"]:
+            print(f"   [注意] {d['missing_text']} 条正样本缺少转写文本")
+
+
+def stats(args):
+    entry = ds.resolve_dataset(args.dataset)
+    print(f"[统计] 数据集: {entry['path']}")
+    print_stats(entry["path"])
 
 
 # ---------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------
 def main():
+    global _PROGRESS_ENABLED
     ap = argparse.ArgumentParser(description="JigBas 三元组数据集构建（Lhotse 混音）")
-    ap.add_argument("--clean-dir", help="干净语料根目录（按说话人分目录）")
-    ap.add_argument("--transcript", help="全局转写文件（utt_id 文本），可选")
-    ap.add_argument("--noise-dir", help="噪声库目录（MUSAN noise 等）")
-    ap.add_argument("--rir-dir", help="房间冲激响应目录（可选）")
-    ap.add_argument("--output", default=DEFAULT_OUTPUT,
-                    help=f"输出目录（默认 {DEFAULT_OUTPUT}）")
+    ap.add_argument("--alias", default="run", help="数据集别名（目录名 <时间>_<别名>）")
+    ap.add_argument("--clean-dir", default=DEFAULT_CLEAN_DIR,
+                    help="干净语料根目录（按说话人分目录，相对项目根）")
+    ap.add_argument("--transcript", default=DEFAULT_TRANSCRIPT,
+                    help="全局转写文件（utt_id 文本），留空自动探测")
+    ap.add_argument("--noise-dir", default=DEFAULT_NOISE_DIR, help="噪声库目录")
+    ap.add_argument("--rir-dir", default=DEFAULT_RIR_DIR, help="房间冲激响应目录")
+    ap.add_argument("--output", default=None,
+                    help="显式指定完整输出目录（默认自动生成 <时间>_<别名>）")
     ap.add_argument("--num-train", type=int, default=2000)
     ap.add_argument("--num-dev", type=int, default=200)
     ap.add_argument("--reject-ratio", type=float, default=0.3,
@@ -532,16 +612,21 @@ def main():
                     help="识别音频叠加双人重叠的概率（默认 0.4）")
     ap.add_argument("--dev-speaker-ratio", type=float, default=0.1,
                     help="dev 集说话人占比，按说话人划分（默认 0.1）")
-    ap.add_argument("--trim", action="store_true", help="裁剪首尾静音")
+    ap.add_argument("--no-trim", dest="trim", action="store_false",
+                    help="不裁剪首尾静音（默认裁剪）")
+    ap.set_defaults(trim=True)
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--stats", action="store_true", help="仅统计已生成数据集")
+    ap.add_argument("--progress", action="store_true",
+                    help="输出 [PROGRESS] 结构化进度行（供 UI 解析）")
+    ap.add_argument("--stats", action="store_true", help="仅统计数据集")
+    ap.add_argument("--dataset", default="latest",
+                    help="--stats 的目标数据集（latest / 别名 / 时间前缀）")
     args = ap.parse_args()
+    _PROGRESS_ENABLED = args.progress
 
     if args.stats:
         stats(args)
         return
-    if not args.clean_dir:
-        ap.error("需要 --clean-dir 指定干净语料目录")
     build(args)
 
 

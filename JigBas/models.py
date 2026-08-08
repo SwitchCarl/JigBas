@@ -1,10 +1,10 @@
 # ==============================================================
-# JigBas Core — 模型加载与识别流水线
-# 所有使用模型的功能集中在此模块，ui.py 仅负责界面显示
+# JigBas Models — 模型加载与声纹工具
+# （原 core.py；单条识别流水线已独立为 demo.py）
+# 所有模型加载集中在此模块，ui.py / demo.py / evaluate.py 共用
 # ==============================================================
 
 import os
-import time
 from contextlib import redirect_stdout
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -96,65 +96,3 @@ def cosine_similarity(a, b):
     a = np.asarray(a, dtype=np.float64).ravel()
     b = np.asarray(b, dtype=np.float64).ravel()
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8))
-
-
-# ---------------------------------------------------------------
-# 识别流水线：唤醒音频声纹比对 → 目标说话人才转写
-# ---------------------------------------------------------------
-def recognize(hub, wake_path, rec_path, threshold, on_stage=None, log=print):
-    """
-    完整识别流程：
-      1. 提取唤醒音频声纹嵌入（on_stage("wake")）
-      2. 提取识别音频声纹嵌入（on_stage("rec")）
-      3. 余弦相似度 >= 阈值 → ASR 转写（on_stage("asr")），否则拒识
-
-    返回 dict:
-      similarity: float | None   声纹余弦相似度
-      accepted:   bool           是否判为目标说话人
-      text:       str | None     转写文本（拒识或失败时为 None）
-      error:      str | None     错误信息（无错误为 None）
-      elapsed:    float          总耗时（秒）
-    """
-    t0 = time.time()
-    result = {"similarity": None, "accepted": False, "text": None,
-              "error": None, "elapsed": 0.0}
-
-    def stage(name):
-        if on_stage:
-            on_stage(name)
-
-    try:
-        log(f"[识别] 唤醒音频: {wake_path}")
-        log(f"[识别] 识别音频: {rec_path}")
-
-        stage("wake")
-        log("[识别] 提取唤醒音频声纹...")
-        emb_wake = extract_embedding(hub, wake_path)
-
-        stage("rec")
-        log("[识别] 提取识别音频声纹...")
-        emb_rec = extract_embedding(hub, rec_path)
-
-        sim = cosine_similarity(emb_wake, emb_rec)
-        result["similarity"] = sim
-        log(f"[识别] 余弦相似度: {sim:.4f} (阈值 {threshold:.2f})")
-
-        if sim >= threshold:
-            result["accepted"] = True
-            stage("asr")
-            log("[识别] 判为目标说话人，执行 ASR 转写...")
-            asr_result = hub.funasr.generate(input=rec_path)
-            text = ""
-            if asr_result and len(asr_result) > 0:
-                text = (asr_result[0].get("text", "")
-                        if isinstance(asr_result[0], dict) else str(asr_result[0]))
-            result["text"] = text
-        else:
-            log("[识别] 判为非目标说话人，拒识（输出空）")
-    except Exception as e:
-        result["error"] = str(e)
-        log(f"[识别] 失败: {e}")
-
-    result["elapsed"] = time.time() - t0
-    log(f"[识别] 完成，总耗时 {result['elapsed']:.2f}s")
-    return result

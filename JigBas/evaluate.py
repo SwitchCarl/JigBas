@@ -1,16 +1,16 @@
 # ==============================================================
 # JigBas 评估脚本 — 基线指标：CER / 拒识率 / 推理耗时
 #
-# 对 build_dataset.py 生成的 manifest 批量推理：
+# 对指定数据集（Temp/Datasets/<时间>_<别名>/）的 manifest 批量推理：
 #   1. 每条样本只跑一次完整流水线（声纹比对 + 正样本 ASR）
 #   2. 声纹阈值扫描无需重复推理（ASR 结果与阈值无关）
 #   3. 输出各阈值下的 CER、拒识率(RR)、误接受率(FAR)、误拒识率(FRR)
-#      及耗时统计，结果写入 Records/
+#      及耗时统计，结果写入该数据集文件夹 evals/<评估时间>.json
 #
 # 用法：
-#   python evaluate.py --manifest Dataset/dev_manifest.jsonl --data-root Dataset
-#   python evaluate.py --manifest ... --threshold 0.5          # 单阈值
-#   python evaluate.py --manifest ... --limit 50               # 调试用小样本
+#   python evaluate.py --dataset latest               # 评估最近构建的数据集
+#   python evaluate.py --dataset baseline --limit 50  # 别名/时间前缀定位
+#   python evaluate.py --dataset ... --progress       # [PROGRESS] 行供 UI 解析
 # ==============================================================
 
 import argparse
@@ -20,10 +20,16 @@ import re
 import sys
 import time
 
-from core import ModelHub, extract_embedding, cosine_similarity
+import datasets as ds
+from models import ModelHub, extract_embedding, cosine_similarity
 
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-RECORDS_DIR = os.path.join(PROJECT_ROOT, "Records")
+_PROGRESS_ENABLED = False
+
+
+def emit_progress(**kw):
+    """--progress 开启时输出结构化进度行（供 UI 解析，普通日志不受影响）"""
+    if _PROGRESS_ENABLED:
+        print(f"[PROGRESS] {json.dumps(kw, ensure_ascii=False)}", flush=True)
 
 
 # ---------------------------------------------------------------
@@ -64,6 +70,7 @@ def run_inference(hub, rows, data_root, log=print):
     """返回 samples: [{id,type,sim,ref,hyp_asr,elapsed,duration}]"""
     samples = []
     n = len(rows)
+    t_start = time.time()
     for i, row in enumerate(rows, 1):
         wake_path = os.path.join(data_root, row["wake_audio"])
         rec_path = os.path.join(data_root, row["rec_audio"])
@@ -96,6 +103,9 @@ def run_inference(hub, rows, data_root, log=print):
         rec["elapsed"] = time.time() - t0
         samples.append(rec)
 
+        if i % 10 == 0 or i == n:
+            emit_progress(phase="infer", done=i, total=n,
+                          elapsed=round(time.time() - t_start, 1))
         if i % 20 == 0 or i == n:
             log(f"[推理] {i}/{n}")
     return samples
@@ -177,10 +187,14 @@ def parse_sweep(spec):
 # ---------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------
-def main():
+def build_parser():
     ap = argparse.ArgumentParser(description="JigBas 基线评估（CER / 拒识率 / 耗时）")
-    ap.add_argument("--manifest", required=True, help="manifest jsonl 路径")
-    ap.add_argument("--data-root", default=".", help="音频相对路径的根目录")
+    ap.add_argument("--dataset", default="latest",
+                    help="目标数据集（latest / 文件夹名 / 别名 / 时间前缀）")
+    ap.add_argument("--split", default="dev", help="评估的划分（默认 dev）")
+    ap.add_argument("--manifest", default=None,
+                    help="显式指定 manifest（覆盖 --dataset/--split）")
+    ap.add_argument("--data-root", default=None, help="音频相对路径的根目录")
     ap.add_argument("--threshold", type=float, default=None,
                     help="单阈值评估（默认扫描 --sweep）")
     ap.add_argument("--sweep", default="0.30:0.75:0.05",
@@ -188,12 +202,30 @@ def main():
     ap.add_argument("--device", default=None, help="cpu / cuda:0（默认自动）")
     ap.add_argument("--limit", type=int, default=0, help="仅评估前 N 条（调试用）")
     ap.add_argument("--output", default=None,
-                    help="结果 JSON 输出路径（默认 Records/eval_<时间戳>.json）")
+                    help="结果 JSON 路径（默认 <数据集>/evals/eval_<时间>.json）")
     ap.add_argument("--detail", action="store_true",
                     help="额外写出逐样本明细 jsonl")
-    args = ap.parse_args()
+    ap.add_argument("--progress", action="store_true",
+                    help="输出 [PROGRESS] 结构化进度行（供 UI 解析）")
+    return ap
 
-    rows = [json.loads(l) for l in open(args.manifest, encoding="utf-8")]
+
+def run(args):
+    """执行评估，返回结果 JSON 路径（供菜单 / UI 复用）"""
+    global _PROGRESS_ENABLED
+    _PROGRESS_ENABLED = getattr(args, "progress", False)
+
+    # 定位数据集与 manifest
+    entry = ds.resolve_dataset(args.dataset)
+    data_root = args.data_root or entry["path"]
+    manifest = args.manifest or os.path.join(
+        entry["path"], f"{args.split}_manifest.jsonl")
+    if not os.path.isfile(manifest):
+        print(f"[评估] manifest 不存在: {manifest}")
+        sys.exit(1)
+    print(f"[评估] 数据集: {entry['name']}  split: {args.split}")
+
+    rows = [json.loads(l) for l in open(manifest, encoding="utf-8")]
     if args.limit > 0:
         rows = rows[: args.limit]
     n_pos = sum(1 for r in rows if r["type"] == "positive")
@@ -207,7 +239,7 @@ def main():
         sys.exit(1)
 
     t0 = time.time()
-    samples = run_inference(hub, rows, args.data_root)
+    samples = run_inference(hub, rows, data_root)
     total_infer = time.time() - t0
 
     thresholds = ([args.threshold] if args.threshold is not None
@@ -232,12 +264,16 @@ def main():
           f"整体 RTF {total_infer/max(total_audio,1e-9):.3f}")
     print(f"[耗时] 单条均值 {sum(s['elapsed'] for s in ok)/max(1,len(ok)):.3f}s")
 
-    # 写 Records
-    os.makedirs(RECORDS_DIR, exist_ok=True)
+    # 结果写入数据集文件夹 evals/<评估时间>.json
+    stamp = time.strftime("%Y%m%d_%H%M%S")
     out_path = args.output or os.path.join(
-        RECORDS_DIR, time.strftime("eval_%Y%m%d_%H%M%S.json"))
+        entry["path"], ds.EVALS_DIR, f"eval_{stamp}.json")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
     payload = {
-        "manifest": os.path.abspath(args.manifest),
+        "dataset": entry["name"],
+        "split": args.split,
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "manifest": os.path.abspath(manifest),
         "device": hub.device,
         "n_samples": len(rows),
         "n_errors": len(samples) - len(ok),
@@ -258,6 +294,17 @@ def main():
                 f.write(json.dumps(s, ensure_ascii=False) + "\n")
         print(f"[输出] 明细已保存: {detail_path}")
 
+    emit_progress(phase="done", done=1, total=1,
+                  output=os.path.basename(out_path),
+                  best_threshold=best["threshold"],
+                  cer=best["cer"], rr=best["rr"], rtf=payload["rtf"])
+    return out_path
+
+
+def main():
+    run(build_parser().parse_args())
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
