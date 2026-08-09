@@ -85,6 +85,80 @@ def apply_cif_fix(log=print):
     log("[补丁] cif_v1 越界修复已应用")
 
 
+def _cif_predictor_forward_fixed(self, hidden, target_label=None, mask=None,
+                                 ignore_id=-1, mask_chunk_predictor=None,
+                                 target_label_length=None):
+    """
+    CifPredictorV2.forward 的稳定性修复版（阶段 E 发现）：
+    唯一改动——alphas 缩放的分母 token_num 加下限 clamp(min=0.1)。
+    空目标训练时 predictor 被 loss_pre 压向很低的 token 数，token_num
+    偶尔趋近 0 → target_length/token_num 爆炸甚至除零 → alphas=inf/NaN
+    → 污染权重 → 崩溃。其余逻辑与 funasr 原版逐行一致。
+    """
+    from torch.cuda.amp import autocast
+    from funasr.models.paraformer.cif_predictor import cif_v1
+
+    with autocast(False):
+        h = hidden
+        context = h.transpose(1, 2)
+        queries = self.pad(context)
+        output = torch.relu(self.cif_conv1d(queries))
+        output = output.transpose(1, 2)
+
+        output = self.cif_output(output)
+        alphas = torch.sigmoid(output)
+        alphas = torch.nn.functional.relu(
+            alphas * self.smooth_factor - self.noise_threshold)
+        if mask is not None:
+            mask = mask.transpose(-1, -2).float()
+            alphas = alphas * mask
+        if mask_chunk_predictor is not None:
+            alphas = alphas * mask_chunk_predictor
+        alphas = alphas.squeeze(-1)
+        mask = mask.squeeze(-1)
+        if target_label_length is not None:
+            target_length = target_label_length.squeeze(-1)
+        elif target_label is not None:
+            target_length = (target_label != ignore_id).float().sum(-1)
+        else:
+            target_length = None
+        token_num = alphas.sum(-1)
+        if target_length is not None:
+            # 修复点：原版为 target_length / token_num，分母可趋近 0
+            alphas *= (target_length / token_num.clamp(min=0.1))[:, None] \
+                .repeat(1, alphas.size(1))
+        elif self.tail_threshold > 0.0:
+            if self.tail_mask:
+                hidden, alphas, token_num = self.tail_process_fn(
+                    hidden, alphas, token_num, mask=mask
+                )
+            else:
+                hidden, alphas, token_num = self.tail_process_fn(
+                    hidden, alphas, token_num, mask=None
+                )
+
+        acoustic_embeds, cif_peak = cif_v1(hidden, alphas, self.threshold)
+        if target_length is None and self.tail_threshold > 0.0:
+            token_num_int = torch.max(token_num).type(torch.int32).item()
+            acoustic_embeds = acoustic_embeds[:, :token_num_int, :]
+
+    return acoustic_embeds, token_num, alphas, cif_peak
+
+
+_PREDICTOR_FIXED = False
+
+
+def apply_predictor_fix(log=print):
+    """猴子补丁：CifPredictorV2.forward 的 token_num 防除零修复（幂等）"""
+    global _PREDICTOR_FIXED
+    if _PREDICTOR_FIXED:
+        return
+    from funasr.models.paraformer.cif_predictor import CifPredictorV2
+    CifPredictorV2.forward = _cif_predictor_forward_fixed
+    _PREDICTOR_FIXED = True
+    log("[补丁] CifPredictorV2 token_num 防除零修复已应用")
+
+
 # ---------------------------------------------------------------
 # FiLM 说话人条件改造
 # ---------------------------------------------------------------
@@ -151,6 +225,7 @@ def build_sc_model(device="cuda:0", sc_checkpoint=None, log=print):
     返回 (model, kwargs)（kwargs 内含 tokenizer / frontend）。
     """
     apply_cif_fix(log)
+    apply_predictor_fix(log)
     from funasr.auto.auto_model import AutoModel
     from models import FUNASR_MODEL_DIR
 
