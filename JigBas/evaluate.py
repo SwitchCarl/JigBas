@@ -11,6 +11,8 @@
 #   python evaluate.py --dataset latest               # 评估最近构建的数据集
 #   python evaluate.py --dataset baseline --limit 50  # 别名/时间前缀定位
 #   python evaluate.py --dataset ... --progress       # [PROGRESS] 行供 UI 解析
+#   python evaluate.py --dataset baseline --sc-checkpoint latest
+#       # SC-Paraformer 评估（第二周）：输出空=拒识，无需阈值扫描
 # ==============================================================
 
 import argparse
@@ -185,6 +187,85 @@ def parse_sweep(spec):
 
 
 # ---------------------------------------------------------------
+# SC-Paraformer 评估（第二周）：输出空文本即拒识，无需阈值
+# ---------------------------------------------------------------
+SC_THRESHOLD = 0.5  # sim 合成值（1.0=非空接受 / 0.0=空拒识）的判定阈值
+
+
+def resolve_sc_checkpoint(dataset, spec):
+    """'latest' → 数据集 checkpoints/ 下步数最大的 step_*.pt；否则按路径使用"""
+    if spec and spec != "latest":
+        return spec
+    entry = ds.resolve_dataset(dataset)
+    import glob
+    ckpts = glob.glob(os.path.join(
+        entry["path"], "checkpoints", "sc_*", "step_*.pt"))
+
+    def step_of(p):
+        m = re.search(r"step_(\d+)\.pt$", p)
+        return int(m.group(1)) if m else -1
+
+    ckpts = sorted(ckpts, key=lambda p: (step_of(p), p))
+    if not ckpts:
+        raise FileNotFoundError(
+            f"数据集 {entry['name']} 下没有 SC checkpoint，请先训练")
+    return ckpts[-1]
+
+
+def run_sc_inference(model, frontend, tokenizer, rows, entry, split,
+                     batch_size=8, log=print):
+    """
+    SC 批量推理：贪心解码，输出非空=接受（sim=1.0），空=拒识（sim=0.0）。
+    复用 compute_metrics 的阈值判定（threshold=0.5），口径与基线一致。
+    """
+    import torch
+    from sc_data import SCDataset, collate_fn, emb_path
+
+    # 缺嵌入缓存时自动补提（dev 200 条约 1 分钟）
+    missing = [r for r in rows
+               if not os.path.isfile(emb_path(entry["path"], split, r["id"]))]
+    if missing:
+        log(f"[评估] 缺少 {len(missing)} 条 wake 嵌入缓存，先补提...")
+        import sc_data
+        sc_data.extract_embeddings(entry["name"], split)
+
+    dataset = SCDataset(entry["name"], split, tokenizer,
+                        limit=len(rows) if rows else 0)
+    loader = torch.utils.data.DataLoader(
+        dataset, batch_size=batch_size, shuffle=False,
+        collate_fn=collate_fn, num_workers=0)
+
+    from sc_model import sc_greedy_decode
+    device = next(model.parameters()).device
+    ref_by_id = {r["id"]: r.get("rec_text", "") for r in dataset.rows}
+    dur_by_id = {r["id"]: r.get("duration", 0.0) for r in dataset.rows}
+    samples, n_done = [], 0
+    t_start = time.time()
+    for batch in loader:
+        t0 = time.time()
+        hyps = sc_greedy_decode(model, frontend, tokenizer, batch, device)
+        per = (time.time() - t0) / max(1, len(hyps))
+        for sid, typ, hyp in zip(batch["ids"], batch["types"], hyps):
+            hyp = hyp or ""
+            samples.append({
+                "id": sid, "type": typ,
+                "sim": 1.0 if normalize_text(hyp) else 0.0,
+                "ref": ref_by_id.get(sid, ""),
+                "hyp_asr": hyp,
+                "elapsed": per,
+                "duration": dur_by_id.get(sid, 0.0),
+                "error": None,
+            })
+        n_done += len(hyps)
+        if n_done % 40 < batch_size or n_done >= len(rows):
+            emit_progress(phase="infer", done=min(n_done, len(rows)),
+                          total=len(rows),
+                          elapsed=round(time.time() - t_start, 1))
+            log(f"[推理] {min(n_done, len(rows))}/{len(rows)}")
+    return samples
+
+
+# ---------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------
 def build_parser():
@@ -199,6 +280,10 @@ def build_parser():
                     help="单阈值评估（默认扫描 --sweep）")
     ap.add_argument("--sweep", default="0.30:0.75:0.05",
                     help="阈值扫描范围 lo:hi:step（默认 0.30:0.75:0.05）")
+    ap.add_argument("--sc-checkpoint", default=None,
+                    help="SC-Paraformer 评估：checkpoint 路径或 latest（数据集下最新）。"
+                         "设置后走 SC 通路：输出空=拒识，不做阈值扫描")
+    ap.add_argument("--sc-batch-size", type=int, default=8, help="SC 推理批大小")
     ap.add_argument("--device", default=None, help="cpu / cuda:0（默认自动）")
     ap.add_argument("--limit", type=int, default=0, help="仅评估前 N 条（调试用）")
     ap.add_argument("--output", default=None,
@@ -231,6 +316,64 @@ def run(args):
     n_pos = sum(1 for r in rows if r["type"] == "positive")
     print(f"[评估] 样本 {len(rows)} 条（正样本 {n_pos}，拒识 {len(rows)-n_pos}）")
 
+    # ---- SC-Paraformer 通路：输出空=拒识，无阈值 ----
+    if getattr(args, "sc_checkpoint", None):
+        from sc_model import build_sc_model
+        ckpt = resolve_sc_checkpoint(args.dataset, args.sc_checkpoint)
+        device = args.device or ("cuda:0" if __import__("torch").cuda.is_available()
+                                 else "cpu")
+        print(f"[评估] SC-Paraformer checkpoint: {ckpt}")
+        model, kwargs = build_sc_model(device=device, sc_checkpoint=ckpt)
+        model.eval()
+        t0 = time.time()
+        samples = run_sc_inference(model, kwargs["frontend"], kwargs["tokenizer"],
+                                   rows, entry, args.split,
+                                   batch_size=args.sc_batch_size)
+        total_infer = time.time() - t0
+        best = compute_metrics(samples, SC_THRESHOLD)
+        print(f"\n[SC] CER {best['cer']:.2%} | 拒识率 {best['rr']:.2%} "
+              f"| FAR {best['far']:.2%} | FRR {best['frr']:.2%} "
+              f"| 综合分 {best['score']:.4f}")
+        total_audio = sum(s["duration"] for s in samples)
+        print(f"[耗时] 总推理 {total_infer:.1f}s，音频总时长 {total_audio:.1f}s，"
+              f"整体 RTF {total_infer/max(total_audio,1e-9):.3f}")
+
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        out_path = args.output or os.path.join(
+            entry["path"], ds.EVALS_DIR, f"eval_{stamp}.json")
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        payload = {
+            "method": "sc-paraformer",
+            "checkpoint": ckpt,
+            "dataset": entry["name"],
+            "split": args.split,
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "manifest": os.path.abspath(manifest),
+            "device": device,
+            "n_samples": len(rows),
+            "n_errors": 0,
+            "total_infer_seconds": round(total_infer, 2),
+            "total_audio_seconds": round(total_audio, 2),
+            "rtf": round(total_infer / max(total_audio, 1e-9), 4),
+            "best_threshold": SC_THRESHOLD,
+            "metrics": [best],
+        }
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        print(f"[输出] 指标已保存: {out_path}")
+        if args.detail:
+            detail_path = os.path.splitext(out_path)[0] + "_detail.jsonl"
+            with open(detail_path, "w", encoding="utf-8") as f:
+                for s in samples:
+                    f.write(json.dumps(s, ensure_ascii=False) + "\n")
+            print(f"[输出] 明细已保存: {detail_path}")
+        emit_progress(phase="done", done=1, total=1,
+                      output=os.path.basename(out_path),
+                      best_threshold=SC_THRESHOLD,
+                      cer=best["cer"], rr=best["rr"], rtf=payload["rtf"])
+        return out_path
+
+    # ---- 基线通路：声纹相似度 + 阈值扫描 ----
     hub = ModelHub(device=args.device)
     print(f"[评估] 推理设备: {hub.device}")
     hub.load()

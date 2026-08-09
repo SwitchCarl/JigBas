@@ -90,10 +90,13 @@ def _cif_predictor_forward_fixed(self, hidden, target_label=None, mask=None,
                                  target_label_length=None):
     """
     CifPredictorV2.forward 的稳定性修复版（阶段 E 发现）：
-    唯一改动——alphas 缩放的分母 token_num 加下限 clamp(min=0.1)。
-    空目标训练时 predictor 被 loss_pre 压向很低的 token 数，token_num
-    偶尔趋近 0 → target_length/token_num 爆炸甚至除零 → alphas=inf/NaN
-    → 污染权重 → 崩溃。其余逻辑与 funasr 原版逐行一致。
+    原版 `alphas *= target_length / token_num` 在空目标训练时有两种死法：
+      1. token_num 恰为 0 → 除零得 inf → 与 padded 位的 0 相乘 = NaN → 污染权重
+      2. token_num 趋近 0 → 缩放因子爆炸 → 数值不稳定
+    但若简单 clamp 分母，又会破坏 "缩放后 alphas 总和 == target_length"
+    这一不变量（sampler/decoder 依赖 T_acoustic == T_text，否则形状不匹配崩溃）。
+    修复：全零样本先兜底（第 0 帧恒在 mask 内）→ 安全缩放 → 二次归一化，
+    既无除零又精确保住不变量。其余逻辑与 funasr 原版逐行一致。
     """
     from torch.cuda.amp import autocast
     from funasr.models.paraformer.cif_predictor import cif_v1
@@ -124,8 +127,17 @@ def _cif_predictor_forward_fixed(self, hidden, target_label=None, mask=None,
             target_length = None
         token_num = alphas.sum(-1)
         if target_length is not None:
-            # 修复点：原版为 target_length / token_num，分母可趋近 0
-            alphas *= (target_length / token_num.clamp(min=0.1))[:, None] \
+            # 修复点 1：全零 token_num 兜底（否则除零/归零）
+            zero = token_num <= 1e-6
+            if zero.any():
+                alphas = alphas.clone()
+                alphas[zero, 0] = 1.0
+                token_num = alphas.sum(-1)
+            # 修复点 2：安全缩放（分母下限防爆炸）+ 二次归一化（保住不变量）
+            alphas *= (target_length / token_num.clamp(min=1e-4))[:, None] \
+                .repeat(1, alphas.size(1))
+            new_sum = alphas.sum(-1).clamp(min=1e-4)
+            alphas *= (target_length / new_sum)[:, None] \
                 .repeat(1, alphas.size(1))
         elif self.tail_threshold > 0.0:
             if self.tail_mask:
@@ -236,3 +248,34 @@ def build_sc_model(device="cuda:0", sc_checkpoint=None, log=print):
         model.load_state_dict(state)
         log(f"[模型] 已加载 SC 权重: {sc_checkpoint}")
     return model.to(device), kwargs
+
+
+# 特殊 token id（见侦察文档 §5：sos=eos=<unk>=词表末位 8403）
+_DROP_TOKENS = ("<blank>", "<s>", "</s>", "<unk>")
+
+
+@torch.no_grad()
+def sc_greedy_decode(model, frontend, tokenizer, batch, device):
+    """
+    SC 贪心解码（评估/演示共用）：
+    encode（FiLM 注入 batch["spk_emb"]）→ CIF 预测 token 数 → decoder argmax。
+    返回与 batch 等长的文本列表；拒识样本预期返回空字符串。
+    """
+    feats, feats_lens = frontend(batch["speech"], batch["speech_lengths"])
+    feats, feats_lens = feats.to(device), feats_lens.to(device)
+    model._spk_emb = batch["spk_emb"].to(device)
+    try:
+        enc, enc_lens = model.encode(feats, feats_lens)
+        pre_embeds, pre_len, _, _ = model.calc_predictor(enc, enc_lens)
+        pre_len = pre_len.round().long()
+        dec_out, _ = model.cal_decoder_with_predictor(
+            enc, enc_lens, pre_embeds, pre_len)
+        ids = dec_out.argmax(-1)
+    finally:
+        model._spk_emb = None
+    hyps = []
+    for i in range(ids.size(0)):
+        toks = [t for t in tokenizer.ids2tokens(ids[i, : int(pre_len[i])].tolist())
+                if t not in _DROP_TOKENS]
+        hyps.append("".join(toks))
+    return hyps
