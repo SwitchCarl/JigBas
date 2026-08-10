@@ -90,6 +90,15 @@ def extract_embedding(hub, path):
     return emb.cpu().numpy() if hasattr(emb, "cpu") else emb
 
 
+def extract_embedding_pcm(hub, pcm, sample_rate=16000):
+    """从 float32 单声道波形（numpy 数组）提取声纹嵌入（分段精判用）"""
+    import torch
+    with open(os.devnull, "w") as f, redirect_stdout(f):
+        emb = hub.wespeaker.extract_embedding_from_pcm(
+            torch.from_numpy(pcm).unsqueeze(0), sample_rate)
+    return emb.cpu().numpy() if hasattr(emb, "cpu") else emb
+
+
 def cosine_similarity(a, b):
     """余弦相似度"""
     import numpy as np

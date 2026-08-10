@@ -23,7 +23,8 @@ import sys
 import time
 
 import datasets as ds
-from models import ModelHub, extract_embedding, cosine_similarity
+from models import (ModelHub, extract_embedding, extract_embedding_pcm,
+                    cosine_similarity)
 
 _PROGRESS_ENABLED = False
 
@@ -265,13 +266,41 @@ def run_sc_inference(model, frontend, tokenizer, rows, entry, split,
     return samples
 
 
-def add_hybrid_sims(samples, rows, entry, split, data_root, log=print):
+def segment_sims(hub, wav_path, emb_wake, win_s=2.5, hop_s=1.25,
+                 min_s=1.0, sr=16000):
+    """滑窗分段提取 rec 嵌入并与 wake 算 sim（灰区精判用）。
+
+    重叠场景下整段嵌入被干扰说话人平均拉偏；目标说话人在无重叠窗内
+    是清晰的，分段后取 max 能恢复真实相似度。过短/提取失败的窗跳过。
+    """
+    import soundfile as sf
+    pcm, fs = sf.read(wav_path, dtype="float32")
+    assert fs == sr, f"采样率 {fs} != {sr}"
+    win, hop, minlen = int(win_s * sr), int(hop_s * sr), int(min_s * sr)
+    sims, st = [], 0
+    while st + minlen <= len(pcm):
+        seg = pcm[st:st + win]
+        try:
+            emb = extract_embedding_pcm(hub, seg, sr)
+            sims.append(cosine_similarity(emb_wake, emb))
+        except Exception:
+            pass  # 纯噪声窗等提取失败直接跳过
+        if st + win >= len(pcm):
+            break
+        st += hop
+    return sims
+
+
+def add_hybrid_sims(samples, rows, entry, split, data_root, log=print,
+                    refine=None, win_s=2.5, hop_s=1.25):
     """
     混合系统（B 方案）：逐样本计算 wespeaker 余弦相似度，回填 sim 与 elapsed。
     回填后 compute_metrics 的阈值判定即为"声纹门控 + SC 识别文本"：
       接受 = sim >= 阈值；正样本的识别文本来自 SC 贪心解码（已全部算好）。
     wake 嵌入优先复用 SC 缓存（spk_emb/<split>/<id>.npy，与注册嵌入同源），
     缺失时才在线提取；rec 嵌入始终在线提取（这是真实部署的推理成本）。
+    refine=(lo,hi) 时启用两级门控：整段 sim 落在灰区 (lo,hi) 内的样本
+    追加滑窗分段精判，取各窗 sim 的 max 作为最终 sim（抗重叠污染）。
     """
     import numpy as np
     from sc_data import emb_path
@@ -280,6 +309,7 @@ def add_hybrid_sims(samples, rows, entry, split, data_root, log=print):
     hub._load_wespeaker(log)  # 只加载声纹模型（CPU），不动 funasr
     row_by_id = {r["id"]: r for r in rows}
     n = len(samples)
+    n_refined = 0
     for i, s in enumerate(samples, 1):
         t0 = time.time()
         cache = emb_path(entry["path"], split, s["id"])
@@ -288,12 +318,25 @@ def add_hybrid_sims(samples, rows, entry, split, data_root, log=print):
         else:
             emb_wake = extract_embedding(
                 hub, os.path.join(data_root, row_by_id[s["id"]]["wake_audio"]))
-        emb_rec = extract_embedding(
-            hub, os.path.join(data_root, row_by_id[s["id"]]["rec_audio"]))
+        rec_path = os.path.join(data_root, row_by_id[s["id"]]["rec_audio"])
+        emb_rec = extract_embedding(hub, rec_path)
         s["sim"] = cosine_similarity(emb_wake, emb_rec)
+        if refine and refine[0] < s["sim"] < refine[1]:
+            seg = segment_sims(hub, rec_path, emb_wake,
+                               win_s=win_s, hop_s=hop_s)
+            n_refined += 1
+            if seg:
+                s["seg_sims"] = [round(x, 4) for x in seg]  # 供离线聚合方式消融
+                s["sim_full"] = round(s["sim"], 4)
+                # 0.7*max + 0.3*full：局部最优窗为主、整段全局证据兜底
+                # （离线消融 6 种聚合方式中综合分最高，抑制单窗侥幸高分）
+                s["sim"] = 0.7 * max(seg) + 0.3 * s["sim"]
+                s["refined"] = True
         s["elapsed"] += time.time() - t0
         if i % 50 == 0 or i == n:
             log(f"[混合] 相似度 {i}/{n}")
+    if refine:
+        log(f"[混合] 灰区 {refine[0]}:{refine[1]} 分段精判 {n_refined}/{n} 条")
     return samples
 
 
@@ -319,6 +362,12 @@ def build_parser():
     ap.add_argument("--sc-hybrid", action="store_true",
                     help="混合系统：wespeaker 相似度门控 + SC 识别文本，"
                          "恢复阈值扫描（需同时给 --sc-checkpoint）")
+    ap.add_argument("--gate-refine", default=None, metavar="LO:HI",
+                    help="两级门控灰区（如 0.15:0.45）：整段 sim 落灰区的样本"
+                         "做滑窗分段精判（取 0.7*max+0.3*full），"
+                         "抗重叠说话人污染嵌入；仅 --sc-hybrid 下生效")
+    ap.add_argument("--gate-win", type=float, default=2.5, help="分段窗长（秒）")
+    ap.add_argument("--gate-hop", type=float, default=1.25, help="分段步长（秒）")
     ap.add_argument("--device", default=None, help="cpu / cuda:0（默认自动）")
     ap.add_argument("--limit", type=int, default=0, help="仅评估前 N 条（调试用）")
     ap.add_argument("--output", default=None,
@@ -368,8 +417,13 @@ def run(args):
 
         if args.sc_hybrid:
             # 混合系统：真实声纹相似度替换合成 sim，恢复阈值扫描
+            refine = None
+            if args.gate_refine:
+                refine = tuple(float(x) for x in args.gate_refine.split(":"))
             t_emb = time.time()
-            add_hybrid_sims(samples, rows, entry, args.split, data_root)
+            add_hybrid_sims(samples, rows, entry, args.split, data_root,
+                            refine=refine, win_s=args.gate_win,
+                            hop_s=args.gate_hop)
             total_infer += time.time() - t_emb
             thresholds = ([args.threshold] if args.threshold is not None
                           else parse_sweep(args.sweep))
@@ -384,7 +438,8 @@ def run(args):
             print("-" * 54)
             print(f"[最优] 阈值 {best['threshold']:.2f}: CER {best['cer']:.2%}, "
                   f"拒识率 {best['rr']:.2%}")
-            metrics, method = results, "sc-hybrid"
+            metrics, method = results, ("sc-hybrid-refine" if refine
+                                        else "sc-hybrid")
             best_threshold = best["threshold"]
         else:
             best = compute_metrics(samples, SC_THRESHOLD)
