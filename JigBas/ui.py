@@ -25,7 +25,8 @@ import unicodedata
 import datasets as ds
 import build_dataset as bd
 from models import ModelHub
-from demo import recognize, DEFAULT_THRESHOLD
+from demo import (recognize, recognize_sc, load_sc_engine,
+                  DEFAULT_THRESHOLD, SC_DEFAULT_THRESHOLD, SC_GRAY_ZONE)
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
@@ -296,6 +297,29 @@ def render(lines):
 hub = ModelHub()
 model_status = hub.status  # 与 models 共享状态字典
 
+# SC 混合系统（第二周）：选中 sc 模式后后台预载，避免首次识别干等
+sc_engine = None        # (model, kwargs)，就绪后由 demo.recognize_sc 使用
+sc_status = "未加载"    # 未加载 / 加载中 / 就绪 / 失败
+
+
+def ensure_sc_engine():
+    """后台预载 SC-Paraformer（幂等）；已就绪或失败不再重复触发"""
+    global sc_engine, sc_status
+    if sc_engine is not None or sc_status in ("加载中", "失败"):
+        return
+
+    def run():
+        global sc_engine, sc_status
+        try:
+            sc_engine = load_sc_engine(log=lambda m: print(m, flush=True))
+            sc_status = "就绪"
+        except Exception as e:
+            print(f"[UI] SC 模型加载失败: {e}", flush=True)
+            sc_status = "失败"
+
+    sc_status = "加载中"
+    threading.Thread(target=run, daemon=True).start()
+
 
 def load_progress():
     """模型加载总进度 [0,1]：Wespeaker 占前 50%，FunASR 占后 50%"""
@@ -358,6 +382,7 @@ class AppState:
         # 基础演示
         self.wake_path = ""
         self.audio_path = ""
+        self.demo_mode = "baseline"  # baseline=旧基线 / sc=SC 混合系统
         self.threshold = DEFAULT_THRESHOLD
         self.demo_focus = 0
         self.is_running = False
@@ -386,7 +411,9 @@ class AppState:
 state = AppState()
 
 # 基础演示可选模块（焦点顺序）
-DEMO_MODULES = ["wake", "rec", "threshold", "start"]
+DEMO_MODULES = ["wake", "rec", "mode", "threshold", "start"]
+# 各模块在焦点列表中的下标（避免魔法数字）
+DEMO_IDX = {name: i for i, name in enumerate(DEMO_MODULES)}
 
 # 识别各阶段: (起始进度, 结束进度, 预估秒数, 描述)
 RUN_STAGES = {
@@ -532,18 +559,36 @@ def demo_rows():
     sel = state.layer == "content"
 
     # 唤醒音频 + 识别音频（并排）
-    wake = audio_box("唤醒音频", state.wake_path, sel and state.demo_focus == 0)
-    rec = audio_box("识别音频", state.audio_path, sel and state.demo_focus == 1)
+    wake = audio_box("唤醒音频", state.wake_path,
+                     sel and state.demo_focus == DEMO_IDX["wake"])
+    rec = audio_box("识别音频", state.audio_path,
+                    sel and state.demo_focus == DEMO_IDX["rec"])
     rows += hcat(wake, rec)
+    rows.append("")
+
+    # 识别模式（基线 / SC 混合，左右键切换）
+    if state.demo_mode == "sc":
+        mode_txt = "SC 混合（两级门控 + SC-Paraformer）"
+        sc_note = f"  SC 模型: {sc_status}"
+    else:
+        mode_txt = "基线（声纹比对 + Paraformer）"
+        sc_note = ""
+    mode_lines = [f"◀ {C_TITLE}{mode_txt}{C_RESET} ▶{C_DIM}{sc_note}{C_RESET}"]
+    mode_box = make_box("识别模式", mode_lines, CONTENT_W,
+                        sel and state.demo_focus == DEMO_IDX["mode"])
+    rows += mode_box
     rows.append("")
 
     # 拒识阈值 + 开始识别（并排）
     th = [f"余弦相似度阈值: {C_TITLE}{state.threshold:.2f}{C_RESET}  {prog_bar(state.threshold, 20)}",
           f"{C_DIM}相似度 ≥ 阈值判为目标说话人，否则拒识{C_RESET}"]
-    th_box = make_box("拒识阈值", th, 56, sel and state.demo_focus == 2)
-    label = ">>> 开 始 识 别 <<<" if state.demo_focus == 3 else "开 始 识 别"
+    th_box = make_box("拒识阈值", th, 56,
+                      sel and state.demo_focus == DEMO_IDX["threshold"])
+    label = (">>> 开 始 识 别 <<<" if state.demo_focus == DEMO_IDX["start"]
+             else "开 始 识 别")
     pad = max(0, (34 - 4 - disp_width(label)) // 2)
-    st_box = make_box("", [" " * pad + label], 34, sel and state.demo_focus == 3,
+    st_box = make_box("", [" " * pad + label], 34,
+                      sel and state.demo_focus == DEMO_IDX["start"],
                       min_height=2)
     rows += hcat(th_box, st_box)
     rows.append("")
@@ -632,21 +677,40 @@ def start_recognition():
     _set_stage("wake")
 
     def work():
-        result = recognize(
-            hub, state.wake_path, state.audio_path, state.threshold,
-            on_stage=_set_stage, log=lambda m: print(m, flush=True))
+        if state.demo_mode == "sc":
+            # SC 混合系统：引擎未就绪则等待后台预载（首次约 40s）
+            ensure_sc_engine()
+            while sc_engine is None and sc_status != "失败":
+                time.sleep(0.2)
+            if sc_engine is None:
+                state.result_lines = [
+                    f"{C_ERR}SC 模型加载失败，详见原窗口日志{C_RESET}"]
+                state.is_running = False
+                return
+            result = recognize_sc(
+                hub, sc_engine[0], sc_engine[1],
+                state.wake_path, state.audio_path, state.threshold,
+                gray=SC_GRAY_ZONE,
+                on_stage=_set_stage, log=lambda m: print(m, flush=True))
+        else:
+            result = recognize(
+                hub, state.wake_path, state.audio_path, state.threshold,
+                on_stage=_set_stage, log=lambda m: print(m, flush=True))
 
         if result["error"]:
             state.result_lines = [f"{C_ERR}识别失败: {result['error']}{C_RESET}"]
         else:
             sim = result["similarity"]
+            tag = "SC 混合" if state.demo_mode == "sc" else "基线"
+            refine_note = ("（分段精判后）" if result.get("refined") else "")
             lines = [
                 f"唤醒: {truncate_middle(state.wake_path, 76)}",
                 f"识别: {truncate_middle(state.audio_path, 76)}",
-                f"{C_DIM}等价命令: python demo.py --wake \"{state.wake_path}\" "
+                f"{C_DIM}等价命令: python demo.py --mode {state.demo_mode} "
+                f"--wake \"{state.wake_path}\" "
                 f"--rec \"{state.audio_path}\" --threshold {state.threshold:.2f}{C_RESET}",
                 "",
-                f"声纹相似度: {C_TITLE}{sim:.4f}{C_RESET}   阈值: {state.threshold:.2f}",
+                f"声纹相似度: {C_TITLE}{sim:.4f}{C_RESET}{refine_note}   阈值: {state.threshold:.2f}",
             ]
             if result["accepted"]:
                 text = result["text"] or ""
@@ -659,7 +723,7 @@ def start_recognition():
                     f"判决结果: {C_WARN}非目标说话人 — 已拒识{C_RESET}",
                     f"转写内容: {C_DIM}（空）{C_RESET}",
                 ]
-            lines += ["", f"推理耗时: {result['elapsed']:.2f}s"]
+            lines += ["", f"推理耗时: {result['elapsed']:.2f}s   模式: {tag}"]
             state.result_lines = lines
 
         state.is_running = False
@@ -943,6 +1007,7 @@ def main_signature():
     parts = [
         state.layer, str(state.module), state.message,
         str(state.demo_focus), f"{state.threshold:.2f}",
+        state.demo_mode, sc_status,
         state.wake_path, state.audio_path,
         str(state.is_running), state.run_stage,
         "".join(strip_ansi(l) for l in state.result_lines),
@@ -1025,8 +1090,18 @@ def handle_demo_key(key):
         if mod == "threshold":
             delta = 0.05 if key == "RIGHT" else -0.05
             state.threshold = round(min(1.0, max(0.0, state.threshold + delta)), 2)
+        elif mod == "mode":
+            state.demo_mode = ("sc" if state.demo_mode == "baseline"
+                               else "baseline")
+            # 切换到各模式的推荐阈值；sc 首次选中即后台预载模型
+            state.threshold = (SC_DEFAULT_THRESHOLD if state.demo_mode == "sc"
+                               else DEFAULT_THRESHOLD)
+            if state.demo_mode == "sc":
+                ensure_sc_engine()
         elif mod in ("wake", "rec"):
-            state.demo_focus = 1 - state.demo_focus  # 左右互换
+            state.demo_focus = (DEMO_IDX["rec"]
+                                if state.demo_focus == DEMO_IDX["wake"]
+                                else DEMO_IDX["wake"])
     elif key == "ENTER":
         mod = DEMO_MODULES[state.demo_focus]
         if mod in ("wake", "rec"):
