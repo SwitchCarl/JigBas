@@ -68,8 +68,21 @@ def train(args, log=print):
     limit = args.overfit if args.overfit > 0 else args.limit
     dataset = SCDataset(args.dataset, "train", tokenizer, limit=limit)
     log(f"[训练] 样本数: {len(dataset)}（batch_size={args.batch_size}）")
+    sampler = None
+    shuffle = not args.overfit  # 过拟合固定顺序便于观察
+    if args.rej_balance:
+        # 拒识过采样：正:拒 抽到 1:1，让"闭嘴"梯度不被正样本淹没（A 方案）
+        types = [r["type"] for r in dataset.rows]
+        n_pos = sum(1 for t in types if t == "positive")
+        n_rej = len(types) - n_pos
+        w_rej = n_pos / max(n_rej, 1)
+        weights = [1.0 if t == "positive" else w_rej for t in types]
+        sampler = torch.utils.data.WeightedRandomSampler(
+            weights, num_samples=len(dataset), replacement=True)
+        shuffle = False  # sampler 与 shuffle 互斥，采样器自带随机
+        log(f"[训练] 拒识平衡采样: 正 {n_pos} / 拒 {n_rej}，拒识权重 {w_rej:.2f}")
     loader = DataLoader(dataset, batch_size=args.batch_size,
-                        shuffle=not args.overfit,  # 过拟合固定顺序便于观察
+                        shuffle=shuffle, sampler=sampler,
                         collate_fn=collate_fn, num_workers=0,
                         drop_last=False)
 
@@ -154,6 +167,8 @@ def build_parser():
                     help="固定训练步数（>0 时覆盖 --epochs）")
     ap.add_argument("--limit", type=int, default=0, help="仅使用前 N 条（调试用）")
     ap.add_argument("--no-specaug", action="store_true", help="关闭 specaug")
+    ap.add_argument("--rej-balance", action="store_true",
+                    help="拒识样本过采样至与正样本 1:1（WeightedRandomSampler）")
     ap.add_argument("--init-from", default=None,
                     help="从指定 SC checkpoint 继续训练")
     ap.add_argument("--output", default=None,
