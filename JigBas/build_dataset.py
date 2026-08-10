@@ -191,7 +191,10 @@ def mix_overlap(target, interf, overlap, sir_db, rng):
     双人重叠混音（Lhotse Cut.mix）。
     overlap ∈ (0,1] 为干扰语音与目标语音的重叠比例；
     sir_db = 20*log10(rms_target / rms_interf)。
-    返回 (混合音频, 实际重叠率)
+    返回 (混合音频, 实际重叠率, 对齐后的干净目标轨)。
+    干净目标轨 = ref（目标在混合时间轴上补零对齐）乘混合后
+    peak_normalize 的缩放因子，与混合波形内的目标成分逐点对齐
+    （第三周提取模型的训练监督信号）。
     """
     d_t = len(target)
     if len(interf) < d_t:
@@ -214,9 +217,16 @@ def mix_overlap(target, interf, overlap, sir_db, rng):
     oth[off_i : off_i + len(interf)] = interf
 
     mix = lhotse_mix(ref, oth, sir_db)
+    # Lhotse Cut.mix 保持参考轨（ref）增益不变、只缩放 other，
+    # 故混合波形内的目标成分 = ref（偏移补零对齐后的干净目标）
 
     ov = (min(d_t, offset + len(interf)) - max(0, offset)) / d_t
-    return peak_normalize(mix, 0.95), round(float(max(0.0, min(1.0, ov))), 3)
+    # peak_normalize 的缩放因子：仅当峰值超过 0.95 才会缩放
+    m = float(np.max(np.abs(mix))) if mix.size else 0.0
+    scale = 0.95 / m if m > 0.95 else 1.0
+    clean = (ref * scale).astype(np.float32)
+    return (peak_normalize(mix, 0.95),
+            round(float(max(0.0, min(1.0, ov))), 3), clean)
 
 
 # ---------------------------------------------------------------
@@ -357,8 +367,15 @@ def augment_rec(x, rng, noise_paths, rir_paths):
 
 
 def generate_sample(idx, split, kind, speakers, speaker_ids, rng,
-                    noise_paths, rir_paths, out_dir, overlap_prob, trim):
-    """生成单条三元组样本，写出 wav 并返回 manifest 记录"""
+                    noise_paths, rir_paths, out_dir, overlap_prob, trim,
+                    save_clean=False):
+    """生成单条三元组样本，写出 wav 并返回 manifest 记录
+    save_clean=True 时额外提供干净目标轨（第三周提取模型训练对）：
+      正样本有重叠 → 写出 <split>/clean/<sid>.wav（与混合波形逐点对齐），
+        manifest clean_audio 指向它；
+      正样本无重叠 → clean_audio 直接复用 rec_audio（识别音频即目标轨）；
+      拒识样本     → clean_audio = ""（目标缺席，训练时监督信号为全零）。
+    """
     target_spk = rng.choice(speaker_ids)
     wake_utt = pick_wake_utterance(speakers[target_spk], rng)
 
@@ -385,6 +402,7 @@ def generate_sample(idx, split, kind, speakers, speaker_ids, rng,
     # 双人重叠：干扰人随机选取（≠ 目标说话人）
     meta["overlap_ratio"] = 0.0
     meta["sir_db"] = None
+    clean = None  # 与混合波形逐点对齐的干净目标轨（仅重叠时由混音函数返回）
     if rng.random() < overlap_prob:
         others = [s for s in speaker_ids if s != target_spk]
         if others:
@@ -394,7 +412,8 @@ def generate_sample(idx, split, kind, speakers, speaker_ids, rng,
                 interf = trim_silence(interf)
             if interf.size >= SAMPLE_RATE // 2:
                 sir = round(rng.uniform(-5, 5), 1)
-                rec, ov = mix_overlap(rec, interf, rng.uniform(0.1, 1.0), sir, rng)
+                rec, ov, clean = mix_overlap(rec, interf,
+                                             rng.uniform(0.1, 1.0), sir, rng)
                 meta["overlap_ratio"], meta["sir_db"] = ov, sir
 
     sid = f"{split}_{idx:06d}"
@@ -403,7 +422,7 @@ def generate_sample(idx, split, kind, speakers, speaker_ids, rng,
     save_audio(os.path.join(out_dir, wake_rel), wake)
     save_audio(os.path.join(out_dir, rec_rel), rec)
 
-    return {
+    row = {
         "id": sid,
         "type": kind,                        # positive / rejection
         "wake_audio": wake_rel.replace(os.sep, "/"),
@@ -415,6 +434,16 @@ def generate_sample(idx, split, kind, speakers, speaker_ids, rng,
         "duration": round(len(rec) / SAMPLE_RATE, 2),
         **meta,
     }
+    if save_clean:
+        if kind == "positive" and clean is not None:
+            clean_rel = os.path.join(split, "clean", sid + ".wav")
+            save_audio(os.path.join(out_dir, clean_rel), clean)
+            row["clean_audio"] = clean_rel.replace(os.sep, "/")
+        elif kind == "positive":
+            row["clean_audio"] = row["rec_audio"]  # 无重叠：rec 即干净目标轨
+        else:
+            row["clean_audio"] = ""                # 拒识：监督信号为全零
+    return row
 
 
 # ---------------------------------------------------------------
@@ -491,7 +520,7 @@ def build(args):
                     rec = generate_sample(
                         idx, split, kind, speakers, spk_ids, rng,
                         noise_paths, rir_paths, out_dir,
-                        args.overlap_prob, args.trim)
+                        args.overlap_prob, args.trim, args.save_clean)
                 except Exception as e:
                     print(f"[跳过] {split} #{idx} 生成失败: {e}")
                     idx += 1
@@ -520,6 +549,7 @@ def build(args):
             "overlap_prob": args.overlap_prob,
             "dev_speaker_ratio": args.dev_speaker_ratio,
             "trim": args.trim, "seed": args.seed,
+            "save_clean": args.save_clean,
         },
         "splits": splits,
     }
@@ -616,6 +646,10 @@ def main():
                     help="不裁剪首尾静音（默认裁剪）")
     ap.set_defaults(trim=True)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--save-clean", action="store_true",
+                    help="额外写出与混合波形逐点对齐的干净目标轨"
+                         "（<split>/clean/，manifest 增 clean_audio 字段），"
+                         "供第三周重叠目标提取模型作训练监督")
     ap.add_argument("--progress", action="store_true",
                     help="输出 [PROGRESS] 结构化进度行（供 UI 解析）")
     ap.add_argument("--stats", action="store_true", help="仅统计数据集")
