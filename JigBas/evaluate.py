@@ -266,16 +266,13 @@ def run_sc_inference(model, frontend, tokenizer, rows, entry, split,
     return samples
 
 
-def segment_sims(hub, wav_path, emb_wake, win_s=2.5, hop_s=1.25,
-                 min_s=1.0, sr=16000):
-    """滑窗分段提取 rec 嵌入并与 wake 算 sim（灰区精判用）。
+def segment_sims_pcm(hub, pcm, emb_wake, win_s=2.5, hop_s=1.25,
+                     min_s=1.0, sr=16000):
+    """滑窗分段提取嵌入并与 wake 算 sim（灰区精判用，内存波形版）。
 
     重叠场景下整段嵌入被干扰说话人平均拉偏；目标说话人在无重叠窗内
     是清晰的，分段后取 max 能恢复真实相似度。过短/提取失败的窗跳过。
     """
-    import soundfile as sf
-    pcm, fs = sf.read(wav_path, dtype="float32")
-    assert fs == sr, f"采样率 {fs} != {sr}"
     win, hop, minlen = int(win_s * sr), int(hop_s * sr), int(min_s * sr)
     sims, st = [], 0
     while st + minlen <= len(pcm):
@@ -289,6 +286,15 @@ def segment_sims(hub, wav_path, emb_wake, win_s=2.5, hop_s=1.25,
             break
         st += hop
     return sims
+
+
+def segment_sims(hub, wav_path, emb_wake, win_s=2.5, hop_s=1.25,
+                 min_s=1.0, sr=16000):
+    """segment_sims_pcm 的文件版包装（demo.py 用）"""
+    import soundfile as sf
+    pcm, fs = sf.read(wav_path, dtype="float32")
+    assert fs == sr, f"采样率 {fs} != {sr}"
+    return segment_sims_pcm(hub, pcm, emb_wake, win_s, hop_s, min_s, sr)
 
 
 def add_hybrid_sims(samples, rows, entry, split, data_root, log=print,
@@ -341,6 +347,111 @@ def add_hybrid_sims(samples, rows, entry, split, data_root, log=print,
 
 
 # ---------------------------------------------------------------
+# 阶段 D：SX 提取前端接入（第三周）
+# ---------------------------------------------------------------
+def run_sx_artifacts(samples, rows, entry, split, data_root,
+                     sc_model, sc_kwargs, args, log=print):
+    """
+    SX 提取前端产物：逐样本用 wake 嵌入条件提取目标人声，回填：
+      sim_raw/hyp_raw  原混合通路的门控 sim 与 SC 文本（改名列存）
+      sx_rms           提取波形 RMS（能量门控依据，明细留档供离线调阈值）
+      sim_sx           提取波形上的声纹 sim（RMS < 能量门控 → 直接 0，白送拒识；
+                       否则过 wespeaker，整段落灰区同样分段精判）
+      hyp_sx           SC 在提取波形上的重解码文本（全样本都解码，
+                       保证 "原始门控+SX-ASR" 消融不受能量门控污染）
+    """
+    import numpy as np
+    import torch
+    from sc_data import emb_path, read_wav
+    from sc_model import sc_greedy_decode
+    from sx_model import sx_load
+
+    device = next(sc_model.parameters()).device
+    sx = sx_load(args.sx_checkpoint, device=device, log=log)
+    hub = ModelHub()
+    hub._load_wespeaker(log)
+    row_by_id = {r["id"]: r for r in rows}
+    refine = None
+    if args.gate_refine:
+        refine = tuple(float(x) for x in args.gate_refine.split(":"))
+
+    n = len(samples)
+    pcms, embs = [], []
+    n_gated = 0
+    t0 = time.time()
+    for i, s in enumerate(samples, 1):
+        row = row_by_id[s["id"]]
+        pcm = read_wav(os.path.join(data_root, row["rec_audio"]))
+        cache = emb_path(entry["path"], split, s["id"])
+        if os.path.isfile(cache):
+            emb_wake = np.load(cache)
+        else:
+            emb_wake = extract_embedding(
+                hub, os.path.join(data_root, row["wake_audio"]))
+        emb_wake = np.asarray(emb_wake, dtype="float32").ravel()
+        with torch.no_grad():
+            out = sx.separate(
+                torch.from_numpy(pcm).unsqueeze(0).to(device),
+                torch.from_numpy(emb_wake).unsqueeze(0).to(device))
+        sx_pcm = out.squeeze(0).cpu().numpy().astype("float32")
+        rms = float(np.sqrt(np.mean(np.square(sx_pcm)) + 1e-12))
+
+        s["sim_raw"], s["hyp_raw"] = s["sim"], s["hyp_asr"]
+        s["sx_rms"] = round(rms, 5)
+        if rms < args.sx_energy_gate:
+            s["sim_sx"] = 0.0     # 能量门控：目标缺席 → 白送拒识
+            n_gated += 1
+        else:
+            sim = cosine_similarity(
+                emb_wake, extract_embedding_pcm(hub, sx_pcm))
+            if refine and refine[0] < sim < refine[1]:
+                seg = segment_sims_pcm(hub, sx_pcm, emb_wake,
+                                       win_s=args.gate_win,
+                                       hop_s=args.gate_hop)
+                if seg:
+                    sim = 0.7 * max(seg) + 0.3 * sim  # 与原始通路同聚合
+                    s["refined_sx"] = True
+            s["sim_sx"] = sim
+        pcms.append(sx_pcm)
+        embs.append(emb_wake)
+        if i % 50 == 0 or i == n:
+            log(f"[SX] 提取+门控 {i}/{n}（{time.time()-t0:.0f}s）")
+    log(f"[SX] 能量门控（<{args.sx_energy_gate}）判拒 {n_gated}/{n} 条")
+
+    # SC 在提取波形上重解码（全样本，批处理）
+    bs = args.sc_batch_size
+    for k in range(0, n, bs):
+        grp = list(range(k, min(k + bs, n)))
+        Lm = max(len(pcms[i]) for i in grp)
+        speech = torch.zeros(len(grp), Lm)
+        for j, i in enumerate(grp):
+            speech[j, : len(pcms[i])] = torch.from_numpy(pcms[i])
+        batch = {
+            "speech": speech,
+            "speech_lengths": torch.tensor([len(pcms[i]) for i in grp]),
+            "spk_emb": torch.from_numpy(np.stack(embs[k:k + bs])),
+        }
+        hyps = sc_greedy_decode(sc_model, sc_kwargs["frontend"],
+                                sc_kwargs["tokenizer"], batch, device)
+        for i, h in zip(grp, hyps):
+            samples[i]["hyp_sx"] = h or ""
+        if (k + bs) % 40 < bs or k + bs >= n:
+            log(f"[SX] SC 重解码 {min(k + bs, n)}/{n}")
+    return samples
+
+
+def config_samples(samples, gate, asr):
+    """按消融配置选 sim/hyp 来源，生成 compute_metrics 用的样本副本"""
+    out = []
+    for s in samples:
+        c = dict(s)
+        c["sim"] = s["sim_sx"] if gate == "sx" else s["sim_raw"]
+        c["hyp_asr"] = s["hyp_sx"] if asr == "sx" else s["hyp_raw"]
+        out.append(c)
+    return out
+
+
+# ---------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------
 def build_parser():
@@ -368,6 +479,12 @@ def build_parser():
                          "抗重叠说话人污染嵌入；仅 --sc-hybrid 下生效")
     ap.add_argument("--gate-win", type=float, default=2.5, help="分段窗长（秒）")
     ap.add_argument("--gate-hop", type=float, default=1.25, help="分段步长（秒）")
+    ap.add_argument("--sx-checkpoint", default=None,
+                    help="SX 提取前端权重（第三周阶段 D）：需配合 --sc-hybrid，"
+                         "逐样本先提目标人声再分别跑门控/ASR 消融（4 配置）")
+    ap.add_argument("--sx-energy-gate", type=float, default=0.01,
+                    help="SX 提取波形的能量门控：RMS 低于此值直接判拒"
+                         "（默认 0.01；明细留 sx_rms 供离线调阈值）")
     ap.add_argument("--device", default=None, help="cpu / cuda:0（默认自动）")
     ap.add_argument("--limit", type=int, default=0, help="仅评估前 N 条（调试用）")
     ap.add_argument("--output", default=None,
@@ -427,20 +544,55 @@ def run(args):
             total_infer += time.time() - t_emb
             thresholds = ([args.threshold] if args.threshold is not None
                           else parse_sweep(args.sweep))
-            results = [compute_metrics(samples, t) for t in thresholds]
-            print()
-            print(f"{'阈值':>6} {'CER':>8} {'拒识率':>8} {'FAR':>8} {'FRR':>8} {'综合分':>8}")
-            print("-" * 54)
-            for m in results:
-                print(f"{m['threshold']:>6.2f} {m['cer']:>8.2%} {m['rr']:>8.2%} "
-                      f"{m['far']:>8.2%} {m['frr']:>8.2%} {m['score']:>8.4f}")
-            best = max(results, key=lambda m: m["score"])
-            print("-" * 54)
-            print(f"[最优] 阈值 {best['threshold']:.2f}: CER {best['cer']:.2%}, "
-                  f"拒识率 {best['rr']:.2%}")
-            metrics, method = results, ("sc-hybrid-refine" if refine
-                                        else "sc-hybrid")
-            best_threshold = best["threshold"]
+
+            def print_sweep(tag, results):
+                print()
+                print(f"[{tag}]")
+                print(f"{'阈值':>6} {'CER':>8} {'拒识率':>8} {'FAR':>8} "
+                      f"{'FRR':>8} {'综合分':>8}")
+                print("-" * 54)
+                for m in results:
+                    print(f"{m['threshold']:>6.2f} {m['cer']:>8.2%} "
+                          f"{m['rr']:>8.2%} {m['far']:>8.2%} "
+                          f"{m['frr']:>8.2%} {m['score']:>8.4f}")
+                b = max(results, key=lambda m: m["score"])
+                print("-" * 54)
+                print(f"[最优] {tag} 阈值 {b['threshold']:.2f}: "
+                      f"CER {b['cer']:.2%}, 拒识率 {b['rr']:.2%}, "
+                      f"综合分 {b['score']:.4f}")
+                return b
+
+            if args.sx_checkpoint:
+                # 阶段 D：SX 提取前端，4 种门控×ASR 消融配置一次跑完
+                t_sx = time.time()
+                samples = run_sx_artifacts(samples, rows, entry, args.split,
+                                           data_root, model, kwargs, args)
+                total_infer += time.time() - t_sx
+                configs = [("raw-gate/raw-asr(混合v2基线)", "raw", "raw"),
+                           ("sx-gate/raw-asr", "sx", "raw"),
+                           ("raw-gate/sx-asr", "raw", "sx"),
+                           ("sx-gate/sx-asr", "sx", "sx")]
+                config_metrics, config_best = {}, {}
+                for name, g, a in configs:
+                    res = [compute_metrics(config_samples(samples, g, a), t)
+                           for t in thresholds]
+                    config_metrics[name] = res
+                    config_best[name] = print_sweep(name, res)
+                # 全局最优配置决定 best_threshold（明细 payload 用）
+                best_name = max(config_best,
+                                key=lambda k: config_best[k]["score"])
+                best = config_best[best_name]
+                print(f"\n[阶段D] 最优配置: {best_name}")
+                metrics = config_metrics
+                method = ("sc-hybrid-sx-refine" if refine
+                          else "sc-hybrid-sx")
+                best_threshold = best["threshold"]
+            else:
+                results = [compute_metrics(samples, t) for t in thresholds]
+                best = print_sweep("混合系统", results)
+                metrics = results
+                method = "sc-hybrid-refine" if refine else "sc-hybrid"
+                best_threshold = best["threshold"]
         else:
             best = compute_metrics(samples, SC_THRESHOLD)
             print(f"\n[SC] CER {best['cer']:.2%} | 拒识率 {best['rr']:.2%} "
@@ -473,6 +625,10 @@ def run(args):
             "best_threshold": best_threshold,
             "metrics": metrics,
         }
+        if args.sc_hybrid and args.sx_checkpoint:
+            payload["sx_checkpoint"] = args.sx_checkpoint
+            payload["sx_energy_gate"] = args.sx_energy_gate
+            payload["best_config"] = best_name
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
         print(f"[输出] 指标已保存: {out_path}")

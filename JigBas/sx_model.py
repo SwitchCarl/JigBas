@@ -14,7 +14,11 @@
 #   正样本无重叠 → rec_audio 本身（生成时不重复写盘，manifest 复用路径）
 #   拒识样本     → 全零（监督掩码输出 0；推理时输出近零能量，
 #                  能量门控白送拒识信号——阶段 D 接入）
-# 损失：线性幅度 L1（帧掩码按样本长度剔除补零帧）；SI-SDR 仅作监控指标。
+# 损失：波形域 waveform_loss（正样本负 SNR + 拒识 log 能量抑制）——
+#   首轮训练诊断发现单纯幅度 L1 会收敛到"全抑制"退化解（零输出代价
+#   ≈ mean(ref_mag)，与恒等掩码同量级，分离梯度被淹没），波形域损失
+#   让"压掉一切"在正样本上代价最大化，迫使模型真正保留目标能量。
+#   SI-SDR / 幅度 L1 仅作监控指标。
 #
 # 实现备注：网络输入的幅度经 log1p 压缩（数值稳定，原始幅度动态范围
 # 两个数量级以上）；掩码与损失都在线性幅度域（与"幅度 L1"设计一致）。
@@ -40,7 +44,14 @@ DEFAULT_CONFIG = {
 
 
 class SXExtractor(nn.Module):
-    """目标说话人提取网络（掩码式 VoiceFilter）"""
+    """目标说话人提取网络（掩码式 VoiceFilter）
+
+    条件注入（阶段 C 第三轮修正）：单次线性投影拼接太弱——诊断发现
+    模型对重叠样本只做"恒等/全抑制"二选一（SI-SDR≈SIR），忽略嵌入。
+    改为 FiLM 乘性调制（与第二周 SC-Paraformer 同款归纳偏置）：
+      x = log1p(mag) · (1 + tanh(emb_gate(emb)))   逐频bin调制，初始≈恒等
+      再与 emb_proj(emb) 拼接进 BLSTM（乘性 + 加性双通路）
+    """
 
     def __init__(self, emb_dim=SPK_EMB_DIM, n_freq=N_FREQ,
                  lstm_hidden=400, lstm_layers=2):
@@ -49,7 +60,8 @@ class SXExtractor(nn.Module):
         # persistent=False：state_dict 不存窗函数，与旧 checkpoint 兼容
         self.register_buffer("window", torch.hann_window(WIN_LENGTH),
                              persistent=False)
-        self.emb_proj = nn.Linear(emb_dim, n_freq)
+        self.emb_gate = nn.Linear(emb_dim, n_freq)   # FiLM 乘性门（tanh）
+        self.emb_proj = nn.Linear(emb_dim, n_freq)   # 加性投影（拼接）
         self.blstm = nn.LSTM(n_freq * 2, lstm_hidden, lstm_layers,
                              batch_first=True, bidirectional=True)
         self.mask_head = nn.Linear(lstm_hidden * 2, n_freq)
@@ -77,7 +89,12 @@ class SXExtractor(nn.Module):
         """
         spec = self.stft(mix_wav)
         mag = spec.abs()
-        x = torch.log1p(mag).transpose(1, 2)                # (B,T,F)
+        # 对数谱输入：mag 均值仅 ~0.1，log1p 后特征 std ~0.1，BLSTM 门控
+        # 近线性区驱动不足（过拟合诊断：选择类映射学不会，恒等/全抑制这种
+        # 偏置级解正常）。log(clamp) 把特征拉到 std~1.5 的正常量级
+        x = torch.log(mag.clamp(min=1e-5)).transpose(1, 2)  # (B,T,F)
+        g = torch.tanh(self.emb_gate(spk_emb)).unsqueeze(1)  # (B,1,F)
+        x = x * (1.0 + g)            # FiLM 乘性调制（初始≈恒等）
         emb = self.emb_proj(spk_emb).unsqueeze(1)           # (B,1,F)
         emb = emb.expand(-1, x.size(1), -1)                 # 逐帧广播拼接
         h, _ = self.blstm(torch.cat([x, emb], dim=-1))      # (B,T,2H)
@@ -107,12 +124,49 @@ def mag_l1_loss(est_mag, ref_mag, lengths):
     """
     线性幅度 L1：逐帧对频率取均值 → 剔除补零帧 → 逐样本归一化 → batch 均值。
     逐样本归一化避免长音频主导损失；拒识样本 ref=0，直接把估计压向 0。
+
+    ⚠️ 阶段 C 首轮训练教训（2026-08-12 诊断）：单独使用该损失会收敛到
+    "全抑制"退化解——零输出代价 ≈ mean(ref_mag) ≈ 0.095，与恒等掩码
+    （0.057）同量级，分离梯度被淹没。现仅作诊断量；主损失用 waveform_loss。
     """
     T = est_mag.shape[-1]
     fm = frame_mask(lengths, T, est_mag.device)             # (B,T)
     l1 = (est_mag - ref_mag).abs().mean(dim=1)              # (B,T) 频率均值
     per_sample = (l1 * fm).sum(dim=1) / fm.sum(dim=1).clamp(min=1.0)
     return per_sample.mean()
+
+
+def waveform_loss(est, ref, lengths, types, eps=1e-8):
+    """
+    波形域提取损失（阶段 C 修正版主损失，破除"全抑制"退化解）：
+      正样本: -SNR = 10·log10(‖est−ref‖² / ‖ref‖²)（按样本长度掩码）
+              —— 零输出代价有界（0 dB）但梯度持续指向保留目标能量，
+                 且直接惩罚错误电平（下游声纹门控需要正确的输出能量）
+      拒识样本: log 能量 10·log10(mean(est²)+eps)，压向 0；
+                clamp(min=-60dB) 兜底——压到 rms≈0.001 后梯度归零，
+                避免无限增大的抑制梯度淹没正样本的分离梯度
+                （过拟合诊断发现：无兜底时拒识项 -52dB 仍持续下压，
+                 部分正样本被连带压成全零）
+    est/ref: (B,L) 波形；types: 每样本 "positive"/"rejection"。
+    """
+    L = est.shape[-1]
+    sm = (torch.arange(L, device=est.device).unsqueeze(0)
+          < lengths.unsqueeze(1)).float()
+    est, ref = est * sm, ref * sm
+    is_pos = torch.tensor([t == "positive" for t in types],
+                          device=est.device, dtype=torch.bool)
+    losses = est.new_zeros(est.shape[0])
+    if is_pos.any():
+        e, r = est[is_pos], ref[is_pos]
+        err = ((e - r) ** 2).sum(-1)
+        sig = (r ** 2).sum(-1).clamp(min=eps)
+        losses[is_pos] = 10 * torch.log10(err.clamp(min=eps) / sig)
+    if (~is_pos).any():
+        e = est[~is_pos]
+        n = lengths[~is_pos].float().clamp(min=1)
+        losses[~is_pos] = (10 * torch.log10((e ** 2).sum(-1) / n + eps)
+                           ).clamp(min=-60.0)   # 抑制到 rms≈0.001 后释放梯度
+    return losses.mean()
 
 
 def si_sdr(est, ref, lengths=None, eps=1e-8):

@@ -5,13 +5,16 @@
 #   输入  = rec_audio（混合波形，含重叠/噪声）
 #   条件  = wake 说话人嵌入（复用 SC 的 spk_emb 缓存，缺失时自动补提）
 #   监督  = clean_audio（--save-clean 生成的对齐干净轨；拒识=全零）
-#   损失  = 线性幅度 L1（帧掩码剔补零帧）；SI-SDR 仅监控正样本
+#   损失  = 波形域（waveform_loss：正样本负 SNR + 拒识 log 能量抑制，
+#           破除幅度 L1 的"全抑制"退化解）；SI-SDR / 幅度 L1 仅监控
 #
 # 用法：
-#   # 过拟合验证（阶段 C 第一步）：前 32 条反复训练 300 步
+#   # 过拟合验证：前 32 条反复训练 300 步
 #   python sx_train.py --dataset sxtrain --overfit 32 --steps 300
 #   # 正式训练
 #   python sx_train.py --dataset sxtrain --epochs 30 --batch-size 16
+#   # 断点续训（checkpoint 含优化器状态）
+#   python sx_train.py --dataset sxtrain --init-from <ckpt> --steps N
 # ==============================================================
 
 import argparse
@@ -26,7 +29,7 @@ from torch.utils.data import DataLoader
 
 import datasets as ds
 from sc_data import read_wav, emb_path
-from sx_model import (SXExtractor, mag_l1_loss, si_sdr,
+from sx_model import (SXExtractor, mag_l1_loss, waveform_loss, si_sdr,
                       DEFAULT_CONFIG, SAMPLE_RATE)
 
 _PROGRESS_ENABLED = False
@@ -140,11 +143,14 @@ def train(args, log=print):
     ensure_embeddings(args.dataset, "train", limit, log)
 
     model = SXExtractor(**DEFAULT_CONFIG).to(device)
+    optim_state = None
     if args.init_from:
         ckpt = torch.load(args.init_from, map_location="cpu")
         state = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
         model.load_state_dict(state)
-        log(f"[训练] 从 checkpoint 继续: {args.init_from}")
+        optim_state = ckpt.get("optimizer") if isinstance(ckpt, dict) else None
+        log(f"[训练] 从 checkpoint 继续: {args.init_from}"
+            f"（{'含' if optim_state else '无'}优化器状态）")
     n_param = sum(p.numel() for p in model.parameters()) / 1e6
     log(f"[训练] SXExtractor 参数量 {n_param:.2f}M（{device}）")
     model.train()
@@ -157,6 +163,9 @@ def train(args, log=print):
                         drop_last=False)
 
     optim = torch.optim.Adam(model.parameters(), lr=args.lr)
+    if optim_state is not None:
+        optim.load_state_dict(optim_state)
+        log("[训练] 优化器状态已恢复（断点续训）")
 
     # checkpoint 目录：<数据集>/checkpoints/sx_<时间>/
     entry = ds.resolve_dataset(args.dataset)
@@ -187,9 +196,8 @@ def train(args, log=print):
             spk_emb = batch["spk_emb"].to(device)
 
             est_mag, _, phase = model(mix, spk_emb)
-            with torch.no_grad():
-                ref_mag = model.stft(ref).abs()
-            loss = mag_l1_loss(est_mag, ref_mag, lengths)
+            est_wav = model.istft(est_mag, phase, mix.shape[-1])
+            loss = waveform_loss(est_wav, ref, lengths, batch["types"])
             if not torch.isfinite(loss):
                 # 安全网：非有限 loss 跳过该步（正常不应触发，触发即记录）
                 log(f"[训练] [警告] step {step} loss 非有限"
@@ -202,27 +210,30 @@ def train(args, log=print):
             optim.zero_grad(set_to_none=True)
 
             if step % args.log_every == 0 or step == 1:
-                # SI-SDR 监控：只对批内正样本（拒识样本 ref 全零无意义）
-                sdr_txt = "n/a"
+                # 监控：正样本 SNR（=-loss 正样本部分）与 SI-SDR、幅度 L1 诊断
+                snr_txt = sdr_txt = l1_txt = "n/a"
                 pos = [i for i, t in enumerate(batch["types"])
                        if t == "positive"]
-                if pos:
-                    with torch.no_grad():
+                with torch.no_grad():
+                    if pos:
                         idx = torch.tensor(pos, device=device)
-                        est_w = model.istft(est_mag[idx], phase[idx],
-                                            mix.shape[-1])
-                        sdr = si_sdr(est_w, ref[idx], lengths[idx]).mean()
+                        snr_txt = f"{-float(waveform_loss(est_wav[idx], ref[idx], lengths[idx], ['positive']*len(pos))):.2f}dB"
+                        sdr = si_sdr(est_wav[idx], ref[idx], lengths[idx]).mean()
                         sdr_txt = f"{float(sdr):.2f}dB"
+                    ref_mag = model.stft(ref).abs()
+                    l1_txt = f"{float(mag_l1_loss(est_mag, ref_mag, lengths)):.4f}"
                 log(f"[训练] step {step}/{total_steps} "
-                    f"loss={loss.item():.4f} si_sdr={sdr_txt} "
+                    f"loss={loss.item():.2f} snr={snr_txt} "
+                    f"si_sdr={sdr_txt} mag_l1={l1_txt} "
                     f"({time.time()-t0:.0f}s)")
                 emit_progress(phase="train", done=step, total=total_steps,
-                              loss=round(loss.item(), 4),
+                              loss=round(loss.item(), 3),
                               si_sdr=None if sdr_txt == "n/a"
                               else round(float(sdr), 2))
             if step % args.save_every == 0 or step == total_steps:
                 ckpt = os.path.join(run_dir, f"step_{step}.pt")
                 torch.save({"state_dict": model.state_dict(),
+                            "optimizer": optim.state_dict(),
                             "config": DEFAULT_CONFIG, "step": step}, ckpt)
                 log(f"[训练] 已保存: {ckpt}")
             if args.steps > 0 and step >= args.steps:
