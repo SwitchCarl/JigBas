@@ -40,6 +40,8 @@ DEFAULT_CONFIG = {
     "n_freq": N_FREQ,
     "lstm_hidden": 400,
     "lstm_layers": 2,
+    "use_film": True,      # FiLM 乘性门（第三轮修复）
+    "input_mode": "log",   # 对数谱输入（第三轮修复）；初版为 "log1p"
 }
 
 
@@ -48,23 +50,34 @@ class SXExtractor(nn.Module):
 
     条件注入（阶段 C 第三轮修正）：单次线性投影拼接太弱——诊断发现
     模型对重叠样本只做"恒等/全抑制"二选一（SI-SDR≈SIR），忽略嵌入。
-    改为 FiLM 乘性调制（与第二周 SC-Paraformer 同款归纳偏置）：
-      x = log1p(mag) · (1 + tanh(emb_gate(emb)))   逐频bin调制，初始≈恒等
-      再与 emb_proj(emb) 拼接进 BLSTM（乘性 + 加性双通路）
+    修复 = 对数谱输入 + FiLM 乘性调制（与第二周 SC-Paraformer 同款
+    归纳偏置）：x = log(mag) · (1 + tanh(emb_gate(emb)))，初始≈恒等，
+    再与 emb_proj(emb) 拼接进 BLSTM（乘性 + 加性双通路）。
+    use_film=False / input_mode="log1p" 仅用于加载初版 checkpoint。
     """
 
     def __init__(self, emb_dim=SPK_EMB_DIM, n_freq=N_FREQ,
-                 lstm_hidden=400, lstm_layers=2):
+                 lstm_hidden=400, lstm_layers=2,
+                 use_film=True, input_mode="log"):
         super().__init__()
         self.n_freq = n_freq
+        self.use_film = use_film
+        self.input_mode = input_mode
         # persistent=False：state_dict 不存窗函数，与旧 checkpoint 兼容
         self.register_buffer("window", torch.hann_window(WIN_LENGTH),
                              persistent=False)
-        self.emb_gate = nn.Linear(emb_dim, n_freq)   # FiLM 乘性门（tanh）
-        self.emb_proj = nn.Linear(emb_dim, n_freq)   # 加性投影（拼接）
+        if use_film:
+            self.emb_gate = nn.Linear(emb_dim, n_freq)   # FiLM 乘性门（tanh）
+        self.emb_proj = nn.Linear(emb_dim, n_freq)       # 加性投影（拼接）
         self.blstm = nn.LSTM(n_freq * 2, lstm_hidden, lstm_layers,
                              batch_first=True, bidirectional=True)
         self.mask_head = nn.Linear(lstm_hidden * 2, n_freq)
+        # 掩码偏置初始化为 +2（初始掩码≈sigmoid(2)=0.88，近恒等）。
+        # 全量训练第四轮诊断：默认零偏置下拒识样本的抑制梯度在最初几步
+        # 就把掩码压进 sigmoid 饱和区（输出≈0 处梯度≈0），正样本的分离
+        # 梯度再也拉不回来——"全抑制"死锁。近恒等起点让正负样本的梯度
+        # 都在 sigmoid 活跃区内竞争，网络有条件嵌入可用，学得会区分。
+        nn.init.constant_(self.mask_head.bias, 2.0)
 
     # ---- STFT / ISTFT ----
     def stft(self, wav):
@@ -92,9 +105,13 @@ class SXExtractor(nn.Module):
         # 对数谱输入：mag 均值仅 ~0.1，log1p 后特征 std ~0.1，BLSTM 门控
         # 近线性区驱动不足（过拟合诊断：选择类映射学不会，恒等/全抑制这种
         # 偏置级解正常）。log(clamp) 把特征拉到 std~1.5 的正常量级
-        x = torch.log(mag.clamp(min=1e-5)).transpose(1, 2)  # (B,T,F)
-        g = torch.tanh(self.emb_gate(spk_emb)).unsqueeze(1)  # (B,1,F)
-        x = x * (1.0 + g)            # FiLM 乘性调制（初始≈恒等）
+        if self.input_mode == "log1p":
+            x = torch.log1p(mag).transpose(1, 2)        # 初版（弱特征，弃用）
+        else:
+            x = torch.log(mag.clamp(min=1e-5)).transpose(1, 2)  # (B,T,F)
+        if self.use_film:
+            g = torch.tanh(self.emb_gate(spk_emb)).unsqueeze(1)  # (B,1,F)
+            x = x * (1.0 + g)        # FiLM 乘性调制（初始≈恒等）
         emb = self.emb_proj(spk_emb).unsqueeze(1)           # (B,1,F)
         emb = emb.expand(-1, x.size(1), -1)                 # 逐帧广播拼接
         h, _ = self.blstm(torch.cat([x, emb], dim=-1))      # (B,T,2H)
@@ -136,7 +153,7 @@ def mag_l1_loss(est_mag, ref_mag, lengths):
     return per_sample.mean()
 
 
-def waveform_loss(est, ref, lengths, types, eps=1e-8):
+def waveform_loss(est, ref, lengths, types, eps=1e-8, rej_weight=0.3):
     """
     波形域提取损失（阶段 C 修正版主损失，破除"全抑制"退化解）：
       正样本: -SNR = 10·log10(‖est−ref‖² / ‖ref‖²)（按样本长度掩码）
@@ -147,6 +164,10 @@ def waveform_loss(est, ref, lengths, types, eps=1e-8):
                 避免无限增大的抑制梯度淹没正样本的分离梯度
                 （过拟合诊断发现：无兜底时拒识项 -52dB 仍持续下压，
                  部分正样本被连带压成全零）
+      rej_weight: 拒识项权重（默认 0.3）。全量训练第四轮诊断：拒识占
+                30% 且抑制任务远易于分离任务，等权时抑制梯度在训练初期
+                占主导，把掩码压进 sigmoid 饱和区形成死锁；降权后正负
+                梯度量级匹配（配合 mask_head 偏置 +2 的近恒等初始化）。
     est/ref: (B,L) 波形；types: 每样本 "positive"/"rejection"。
     """
     L = est.shape[-1]
@@ -164,8 +185,9 @@ def waveform_loss(est, ref, lengths, types, eps=1e-8):
     if (~is_pos).any():
         e = est[~is_pos]
         n = lengths[~is_pos].float().clamp(min=1)
-        losses[~is_pos] = (10 * torch.log10((e ** 2).sum(-1) / n + eps)
-                           ).clamp(min=-60.0)   # 抑制到 rms≈0.001 后释放梯度
+        losses[~is_pos] = rej_weight * (
+            10 * torch.log10((e ** 2).sum(-1) / n + eps)
+        ).clamp(min=-60.0)   # 抑制到 rms≈0.001 后释放梯度
     return losses.mean()
 
 
@@ -196,10 +218,14 @@ def sx_load(checkpoint, device="cuda:0", log=print):
     """从 sx_train 保存的 checkpoint 重建模型（含 config 的新格式优先）"""
     ckpt = torch.load(checkpoint, map_location="cpu")
     if isinstance(ckpt, dict) and "state_dict" in ckpt:
-        config = ckpt.get("config", DEFAULT_CONFIG)
+        config = {**DEFAULT_CONFIG, **ckpt.get("config", {})}
         state = ckpt["state_dict"]
     else:  # 兼容纯 state_dict
         config, state = DEFAULT_CONFIG, ckpt
+    # 初版 checkpoint（FiLM 加入前）无 emb_gate 权重且训练时输入是 log1p，
+    # 按 state_dict 键自动退回旧结构/旧输入模式，保证旧模型可评估
+    if "emb_gate.weight" not in state:
+        config = {**config, "use_film": False, "input_mode": "log1p"}
     model = SXExtractor(**config)
     model.load_state_dict(state)
     log(f"[模型] 已加载 SX 权重: {checkpoint}")
