@@ -42,6 +42,8 @@ DEFAULT_CONFIG = {
     "lstm_layers": 2,
     "use_film": True,      # FiLM 乘性门（第三轮修复）
     "input_mode": "log",   # 对数谱输入（第三轮修复）；初版为 "log1p"
+    "mask_bias": 0.0,      # 掩码头偏置初始化；仅影响训练起点（第五轮消融：
+                           # +2 近恒等起点会杀死分离学习，必须为 0）
 }
 
 
@@ -58,7 +60,7 @@ class SXExtractor(nn.Module):
 
     def __init__(self, emb_dim=SPK_EMB_DIM, n_freq=N_FREQ,
                  lstm_hidden=400, lstm_layers=2,
-                 use_film=True, input_mode="log"):
+                 use_film=True, input_mode="log", mask_bias=0.0):
         super().__init__()
         self.n_freq = n_freq
         self.use_film = use_film
@@ -72,12 +74,11 @@ class SXExtractor(nn.Module):
         self.blstm = nn.LSTM(n_freq * 2, lstm_hidden, lstm_layers,
                              batch_first=True, bidirectional=True)
         self.mask_head = nn.Linear(lstm_hidden * 2, n_freq)
-        # 掩码偏置初始化为 +2（初始掩码≈sigmoid(2)=0.88，近恒等）。
-        # 全量训练第四轮诊断：默认零偏置下拒识样本的抑制梯度在最初几步
-        # 就把掩码压进 sigmoid 饱和区（输出≈0 处梯度≈0），正样本的分离
-        # 梯度再也拉不回来——"全抑制"死锁。近恒等起点让正负样本的梯度
-        # 都在 sigmoid 活跃区内竞争，网络有条件嵌入可用，学得会区分。
-        nn.init.constant_(self.mask_head.bias, 2.0)
+        # 掩码头偏置初始化（默认 0，初始掩码 0.5）。⚠️ 第五轮消融结论：
+        # +2 近恒等起点看似友好，实则完全杀死分离学习（重叠 SI-SDR 提升
+        # 0.00dB）——分离学习需要抑制梯度从 0.5 起点向下"雕刻"掩码。
+        # 该参数仅影响训练起点，加载 checkpoint 时被权重覆盖。
+        nn.init.constant_(self.mask_head.bias, mask_bias)
 
     # ---- STFT / ISTFT ----
     def stft(self, wav):
@@ -153,21 +154,25 @@ def mag_l1_loss(est_mag, ref_mag, lengths):
     return per_sample.mean()
 
 
-def waveform_loss(est, ref, lengths, types, eps=1e-8, rej_weight=0.3):
+def waveform_loss(est, ref, lengths, types, eps=1e-8, rej_weight=1.0,
+                  rej_clamp=-40.0):
     """
     波形域提取损失（阶段 C 修正版主损失，破除"全抑制"退化解）：
       正样本: -SNR = 10·log10(‖est−ref‖² / ‖ref‖²)（按样本长度掩码）
               —— 零输出代价有界（0 dB）但梯度持续指向保留目标能量，
                  且直接惩罚错误电平（下游声纹门控需要正确的输出能量）
       拒识样本: log 能量 10·log10(mean(est²)+eps)，压向 0；
-                clamp(min=-60dB) 兜底——压到 rms≈0.001 后梯度归零，
+                clamp(min=rej_clamp) 兜底——到达下限后梯度归零，
                 避免无限增大的抑制梯度淹没正样本的分离梯度
                 （过拟合诊断发现：无兜底时拒识项 -52dB 仍持续下压，
                  部分正样本被连带压成全零）
-      rej_weight: 拒识项权重（默认 0.3）。全量训练第四轮诊断：拒识占
-                30% 且抑制任务远易于分离任务，等权时抑制梯度在训练初期
-                占主导，把掩码压进 sigmoid 饱和区形成死锁；降权后正负
-                梯度量级匹配（配合 mask_head 偏置 +2 的近恒等初始化）。
+      rej_weight: 拒识项权重。⚠️ 第五轮消融（2026-08-12 过拟合64条）：
+                降权到 0.3 会完全杀死分离学习（重叠 SI-SDR 提升 0.00dB）
+                ——强抑制梯度是"雕刻"掩码选择性的必要力量，必须 1.0
+      rej_clamp:  拒识项下限。全量训练时用 -40dB（rms≈0.01）而非 -60：
+                -60 会把掩码压进 sigmoid 深饱和区（pre-act≈-5），
+                全量数据上无法恢复（"全抑制"死锁）；-40 让掩码停留在
+                活跃区边缘，抑制仍足够（能量门控阈值可相应上调）
     est/ref: (B,L) 波形；types: 每样本 "positive"/"rejection"。
     """
     L = est.shape[-1]
@@ -187,7 +192,7 @@ def waveform_loss(est, ref, lengths, types, eps=1e-8, rej_weight=0.3):
         n = lengths[~is_pos].float().clamp(min=1)
         losses[~is_pos] = rej_weight * (
             10 * torch.log10((e ** 2).sum(-1) / n + eps)
-        ).clamp(min=-60.0)   # 抑制到 rms≈0.001 后释放梯度
+        ).clamp(min=rej_clamp)   # 到达抑制下限后释放梯度
     return losses.mean()
 
 

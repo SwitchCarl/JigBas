@@ -85,6 +85,10 @@ class SXDataset:
         return {
             "id": row["id"],
             "type": row["type"],
+            # 重叠正样本标记：训练监控只对这类样本算 SNR/SI-SDR——
+            # 无重叠样本 ref==mix，恒等输出即满分，混进指标会造成
+            # "snr 30-60dB"的假象（v3 训练实际学到了纯恒等的教训）
+            "overlap": bool(ca and ca != row["rec_audio"]),
             "mix": mix,                           # (samples,) float32
             "ref": ref,                           # (samples,) float32
             "spk_emb": emb.astype(np.float32),    # (256,)
@@ -108,6 +112,7 @@ def collate_fn(batch):
         "mix": mix, "ref": ref, "lengths": lengths, "spk_emb": spk_emb,
         "ids": [b["id"] for b in batch],
         "types": [b["type"] for b in batch],
+        "overlaps": [b["overlap"] for b in batch],
     }
 
 
@@ -142,7 +147,7 @@ def train(args, log=print):
     limit = args.overfit if args.overfit > 0 else args.limit
     ensure_embeddings(args.dataset, "train", limit, log)
 
-    model = SXExtractor(**DEFAULT_CONFIG).to(device)
+    model = SXExtractor(**{**DEFAULT_CONFIG, "mask_bias": args.mask_bias}).to(device)
     optim_state = None
     if args.init_from:
         ckpt = torch.load(args.init_from, map_location="cpu")
@@ -197,7 +202,16 @@ def train(args, log=print):
 
             est_mag, _, phase = model(mix, spk_emb)
             est_wav = model.istft(est_mag, phase, mix.shape[-1])
-            loss = waveform_loss(est_wav, ref, lengths, batch["types"])
+            loss = waveform_loss(est_wav, ref, lengths, batch["types"],
+                                 rej_weight=args.rej_weight,
+                                 rej_clamp=args.rej_clamp)
+            if args.mag_aux > 0:
+                # 幅度域辅助损失（第五轮探针）：波形 -SNR 经 ISTFT 回传
+                # 的梯度相位敏感、对掩码选择性学习信号弱；幅度 L1 给掩码
+                # 直接的逐频 bin 监督（拒识 ref=0 与抑制方向一致）
+                ref_mag = model.stft(ref).abs()
+                loss = loss + args.mag_aux * mag_l1_loss(
+                    est_mag, ref_mag, lengths)
             if not torch.isfinite(loss):
                 # 安全网：非有限 loss 跳过该步（正常不应触发，触发即记录）
                 log(f"[训练] [警告] step {step} loss 非有限"
@@ -210,21 +224,29 @@ def train(args, log=print):
             optim.zero_grad(set_to_none=True)
 
             if step % args.log_every == 0 or step == 1:
-                # 监控：正样本 SNR（=-loss 正样本部分）与 SI-SDR、幅度 L1 诊断
-                snr_txt = sdr_txt = l1_txt = "n/a"
-                pos = [i for i, t in enumerate(batch["types"])
-                       if t == "positive"]
+                # 监控：SNR/SI-SDR 只在"重叠正样本"上计算（无重叠样本
+                # ref==mix，恒等输出即满分，会淹没问题——见 SXDataset）
+                snr_txt = sdr_txt = l1_txt = rej_txt = "n/a"
+                pos = [i for i, (t, ov) in enumerate(
+                    zip(batch["types"], batch["overlaps"]))
+                    if t == "positive" and ov]
+                rej = [i for i, t in enumerate(batch["types"])
+                       if t != "positive"]
                 with torch.no_grad():
                     if pos:
                         idx = torch.tensor(pos, device=device)
                         snr_txt = f"{-float(waveform_loss(est_wav[idx], ref[idx], lengths[idx], ['positive']*len(pos))):.2f}dB"
                         sdr = si_sdr(est_wav[idx], ref[idx], lengths[idx]).mean()
                         sdr_txt = f"{float(sdr):.2f}dB"
+                    if rej:
+                        idx = torch.tensor(rej, device=device)
+                        r = est_wav[idx].pow(2).mean(-1).sqrt()
+                        rej_txt = f"{float(r.mean()):.4f}"
                     ref_mag = model.stft(ref).abs()
                     l1_txt = f"{float(mag_l1_loss(est_mag, ref_mag, lengths)):.4f}"
                 log(f"[训练] step {step}/{total_steps} "
-                    f"loss={loss.item():.2f} snr={snr_txt} "
-                    f"si_sdr={sdr_txt} mag_l1={l1_txt} "
+                    f"loss={loss.item():.2f} ov_snr={snr_txt} "
+                    f"ov_si_sdr={sdr_txt} rej_rms={rej_txt} mag_l1={l1_txt} "
                     f"({time.time()-t0:.0f}s)")
                 emit_progress(phase="train", done=step, total=total_steps,
                               loss=round(loss.item(), 3),
@@ -257,6 +279,14 @@ def build_parser():
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--mask-bias", type=float, default=0.0,
+                    help="掩码头偏置初始化（消融结论：+2 会杀死分离学习）")
+    ap.add_argument("--rej-weight", type=float, default=1.0,
+                    help="拒识抑制项权重（消融结论：0.3 会杀死分离学习）")
+    ap.add_argument("--rej-clamp", type=float, default=-40.0,
+                    help="拒识抑制项下限 dB（-40 防 sigmoid 深饱和死锁）")
+    ap.add_argument("--mag-aux", type=float, default=0.0,
+                    help="幅度 L1 辅助损失权重（0=关闭；给掩码逐bin监督）")
     ap.add_argument("--grad-clip", type=float, default=5.0)
     ap.add_argument("--overfit", type=int, default=0,
                     help="过拟合测试：只取前 N 条训练")
