@@ -51,7 +51,7 @@ class SXDataset:
       ref: clean_audio 对齐干净轨；拒识样本为等长全零
     """
 
-    def __init__(self, dataset, split, limit=0):
+    def __init__(self, dataset, split, limit=0, overlap_only=False):
         entry = ds.resolve_dataset(dataset)
         self.ds_path = entry["path"]
         self.split = split
@@ -61,6 +61,13 @@ class SXDataset:
             raise ValueError(
                 f"数据集 {entry['name']} 的 manifest 缺少 clean_audio 字段，"
                 f"请用 build_dataset.py --save-clean 重新生成")
+        if overlap_only:
+            # 纯分离训练实验（第六轮）：只保留"有重叠的正样本"——
+            # 排除拒识（抑制任务可能毒化分离学习）与无重叠正样本
+            # （ref==mix，恒等即满分，无监督价值）
+            self.rows = [r for r in self.rows
+                         if r["type"] == "positive" and r["clean_audio"]
+                         and r["clean_audio"] != r["rec_audio"]]
         if limit > 0:
             self.rows = self.rows[:limit]
 
@@ -160,7 +167,8 @@ def train(args, log=print):
     log(f"[训练] SXExtractor 参数量 {n_param:.2f}M（{device}）")
     model.train()
 
-    dataset = SXDataset(args.dataset, "train", limit=limit)
+    dataset = SXDataset(args.dataset, "train", limit=limit,
+                        overlap_only=args.overlap_only)
     log(f"[训练] 样本数: {len(dataset)}（batch_size={args.batch_size}）")
     loader = DataLoader(dataset, batch_size=args.batch_size,
                         shuffle=not args.overfit,  # 过拟合固定顺序便于观察
@@ -293,6 +301,8 @@ def build_parser():
     ap.add_argument("--steps", type=int, default=0,
                     help="固定训练步数（>0 时覆盖 --epochs）")
     ap.add_argument("--limit", type=int, default=0, help="仅使用前 N 条（调试用）")
+    ap.add_argument("--overlap-only", action="store_true",
+                    help="纯分离训练实验：只用有重叠的正样本")
     ap.add_argument("--init-from", default=None,
                     help="从指定 SX checkpoint 继续训练")
     ap.add_argument("--output", default=None,
