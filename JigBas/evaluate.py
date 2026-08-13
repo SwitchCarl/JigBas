@@ -491,9 +491,11 @@ def build_parser():
     ap.add_argument("--sx-checkpoint", default=None,
                     help="SX 提取前端权重（第三周阶段 D）：需配合 --sc-hybrid，"
                          "逐样本先提目标人声再分别跑门控/ASR 消融（4 配置）")
-    ap.add_argument("--sx-energy-gate", type=float, default=0.01,
-                    help="SX 提取波形的能量门控：RMS 低于此值直接判拒"
-                         "（默认 0.01；明细留 sx_rms 供离线调阈值）")
+    ap.add_argument("--sx-energy-gate", type=float, default=0.0,
+                    help="SX 提取波形的能量门控：RMS 低于此值直接判拒。"
+                         "⚠️ 已证伪并默认关闭（默认 0.0）：正/拒样本 RMS 分布重叠，"
+                         "且该硬截止会误杀音量偏低的正样本（rms≈0.006 时 sim_sx 仍可高达 0.6）。"
+                         "保留参数仅供复现阶段D旧结果")
     ap.add_argument("--device", default=None, help="cpu / cuda:0（默认自动）")
     ap.add_argument("--limit", type=int, default=0, help="仅评估前 N 条（调试用）")
     ap.add_argument("--output", default=None,
