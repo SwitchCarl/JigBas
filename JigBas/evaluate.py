@@ -445,7 +445,16 @@ def config_samples(samples, gate, asr):
     out = []
     for s in samples:
         c = dict(s)
-        c["sim"] = s["sim_sx"] if gate == "sx" else s["sim_raw"]
+        if gate == "sx":
+            c["sim"] = s["sim_sx"]
+        elif gate == "comb":
+            # 联合门控（阶段D 离线扫描最优）：原始/提取两条 wespeaker 声纹
+            # 通路互补，平均后判决——FRR 34.56%→32.35%、CER 43.34→41.34%，
+            # RR 保持 93.75%（综合分 0.7520→0.7621）。零重训成本。
+            # ⚠️ dev 集调参，报告需如实标注过拟合风险。
+            c["sim"] = 0.5 * s["sim_raw"] + 0.5 * s["sim_sx"]
+        else:
+            c["sim"] = s["sim_raw"]
         c["hyp_asr"] = s["hyp_sx"] if asr == "sx" else s["hyp_raw"]
         out.append(c)
     return out
@@ -571,7 +580,8 @@ def run(args):
                 configs = [("raw-gate/raw-asr(混合v2基线)", "raw", "raw"),
                            ("sx-gate/raw-asr", "sx", "raw"),
                            ("raw-gate/sx-asr", "raw", "sx"),
-                           ("sx-gate/sx-asr", "sx", "sx")]
+                           ("sx-gate/sx-asr", "sx", "sx"),
+                           ("comb-gate/sx-asr(联合门控)", "comb", "sx")]
                 config_metrics, config_best = {}, {}
                 for name, g, a in configs:
                     res = [compute_metrics(config_samples(samples, g, a), t)
