@@ -17,7 +17,7 @@ import json
 import os
 import time
 
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+from lib.paths import REPO_ROOT
 
 DATASETS_ROOT_REL = os.path.join("..", "..", "Temp", "Datasets")
 LATEST_FILE = "latest.txt"
@@ -28,14 +28,14 @@ EVALS_DIR = "evals"
 # ---------------------------------------------------------------
 # 路径
 # ---------------------------------------------------------------
-def resolve_path(p, base=PROJECT_ROOT):
+def resolve_path(p, base=REPO_ROOT):
     """相对路径按项目根解析为绝对路径；绝对路径原样返回"""
     if not p:
         return p
     return p if os.path.isabs(p) else os.path.normpath(os.path.join(base, p))
 
 
-def rel_path(p, base=PROJECT_ROOT):
+def rel_path(p, base=REPO_ROOT):
     """绝对路径尽量转回相对项目根的相对路径（用于存储/显示）"""
     if not p or not os.path.isabs(p):
         return p
@@ -154,22 +154,35 @@ def resolve_dataset(name, root=None):
     raise ValueError(f"'{name}' 匹配到多个数据集，请用完整文件夹名。候选: {candidates}")
 
 
+def best_metric(ev):
+    """
+    评估结果中“最优阈值”对应的指标 dict（UI / 列表摘要共用）。
+    兼容两种结构：metrics=list（普通评估）与 metrics=dict<配置名,[阈值指标]>
+    （--final 的 5 配置消融）。无则返回 None。
+    """
+    if not ev:
+        return None
+    best = ev.get("best_threshold")
+    ms = ev.get("metrics")
+    if isinstance(ms, dict):
+        res = [m for group in ms.values() for m in group
+               if isinstance(m, dict) and m.get("threshold") == best]
+    else:
+        res = [m for m in (ms or [])
+               if isinstance(m, dict) and m.get("threshold") == best]
+    return res[0] if res else None
+
+
 def one_line_summary(entry):
     """数据集列表的一行摘要（UI / 控制台共用）"""
     meta = entry["meta"] or {}
     splits = meta.get("splits", {})
     n_train = splits.get("train", {}).get("total", "?")
     n_dev = splits.get("dev", {}).get("total", "?")
-    ev = entry.get("latest_eval")
     ev_txt = ""
-    if ev:
-        best = ev.get("best_threshold")
-        cer = next((m["cer"] for m in ev.get("metrics", [])
-                    if m.get("threshold") == best), None)
-        rr = next((m["rr"] for m in ev.get("metrics", [])
-                   if m.get("threshold") == best), None)
-        if cer is not None:
-            ev_txt = f" | CER {cer:.1%} / RR {rr:.1%}"
+    m = best_metric(entry.get("latest_eval"))
+    if m:
+        ev_txt = f" | CER {m['cer']:.1%} / RR {m['rr']:.1%}"
     return f"{entry['name']} | train {n_train} / dev {n_dev}{ev_txt}"
 
 

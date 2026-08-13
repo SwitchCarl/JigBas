@@ -23,14 +23,18 @@ import os
 import sys
 import time
 
+# 直接运行本脚本时把项目根加入 sys.path（python tools/sx_train.py）
+if __package__ in (None, ""):
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-import datasets as ds
-from sc_data import read_wav, emb_path
-from sx_model import (SXExtractor, mag_l1_loss, waveform_loss, si_sdr,
-                      DEFAULT_CONFIG, SAMPLE_RATE)
+from lib import datasets as ds
+from lib.sc_data import read_wav, emb_path
+from lib.sx_model import (SXExtractor, mag_l1_loss, waveform_loss, si_sdr,
+                          DEFAULT_CONFIG, SAMPLE_RATE)
 
 _PROGRESS_ENABLED = False
 
@@ -125,7 +129,7 @@ def collate_fn(batch):
 
 def ensure_embeddings(dataset, split, limit, log=print):
     """检查所用样本的 wake 嵌入缓存，缺失时自动补提（wespeaker CPU）"""
-    from sc_data import extract_embeddings
+    from lib.sc_data import extract_embeddings
     entry = ds.resolve_dataset(dataset)
     manifest = os.path.join(entry["path"], f"{split}_manifest.jsonl")
     rows = [json.loads(l) for l in open(manifest, encoding="utf-8")]
@@ -144,7 +148,7 @@ def ensure_embeddings(dataset, split, limit, log=print):
 # 训练
 # ---------------------------------------------------------------
 def train(args, log=print):
-    from sx_model import sx_load  # noqa: F401  (init_from 走下方手动加载)
+    from lib.sx_model import sx_load  # noqa: F401  (init_from 走下方手动加载)
 
     device = args.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)

@@ -13,6 +13,9 @@
 #   python evaluate.py --dataset ... --progress       # [PROGRESS] 行供 UI 解析
 #   python evaluate.py --dataset baseline --sc-checkpoint latest
 #       # SC-Paraformer 评估（第二周）：输出空=拒识，无需阈值扫描
+#   python evaluate.py --dataset baseline --final
+#       # 最终系统一键评估（第四周定版）：SX 提取 + 声纹门控 + SC-scx，
+#       # 自动填入最终 checkpoint 与灰区；sx-gate/sx-asr 行即最终系统
 # ==============================================================
 
 import argparse
@@ -22,11 +25,29 @@ import re
 import sys
 import time
 
-import datasets as ds
-from models import (ModelHub, extract_embedding, extract_embedding_pcm,
-                    cosine_similarity)
+# 直接运行本脚本时把项目根加入 sys.path（python app/evaluate.py）
+if __package__ in (None, ""):
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from lib import datasets as ds
+from lib.models import (ModelHub, extract_embedding, extract_embedding_pcm,
+                        cosine_similarity)
+from lib.paths import REPO_ROOT
 
 _PROGRESS_ENABLED = False
+
+# 最终系统（第 4 周定版，综合分 0.7813）默认权重：--final 一键评估时自动填入。
+# SX 提取器 = 阶段 C 纯分离模型（未微调）；SC-scx = 在提取音频上微调
+# 至绝对 8000 步（过拟合前峰值）。路径与 demo.py 的 DEFAULT_SX_CKPT /
+# DEFAULT_SCX_CKPT 保持一致。
+FINAL_SX_CKPT = os.path.normpath(os.path.join(
+    REPO_ROOT, "..", "..", "Temp", "Datasets", "20260811_1914_sxtrain",
+    "checkpoints", "sx_20260812_235228", "step_6000.pt"))
+FINAL_SC_CKPT = os.path.normpath(os.path.join(
+    REPO_ROOT, "..", "..", "Temp", "Datasets", "20260813_0105_scx8k",
+    "checkpoints", "sc_20260813_cont4000", "step_4000.pt"))
+# 最终系统门控口径：两级门控灰区 0.05:0.60，滑窗精判 0.7*max+0.3*full
+FINAL_GATE_REFINE = "0.05:0.60"
 
 
 def emit_progress(**kw):
@@ -220,14 +241,14 @@ def run_sc_inference(model, frontend, tokenizer, rows, entry, split,
     复用 compute_metrics 的阈值判定（threshold=0.5），口径与基线一致。
     """
     import torch
-    from sc_data import SCDataset, collate_fn, emb_path
+    from lib.sc_data import SCDataset, collate_fn, emb_path
 
     # 缺嵌入缓存时自动补提（dev 200 条约 1 分钟）
     missing = [r for r in rows
                if not os.path.isfile(emb_path(entry["path"], split, r["id"]))]
     if missing:
         log(f"[评估] 缺少 {len(missing)} 条 wake 嵌入缓存，先补提...")
-        import sc_data
+        from lib import sc_data
         sc_data.extract_embeddings(entry["name"], split)
 
     dataset = SCDataset(entry["name"], split, tokenizer,
@@ -236,7 +257,7 @@ def run_sc_inference(model, frontend, tokenizer, rows, entry, split,
         dataset, batch_size=batch_size, shuffle=False,
         collate_fn=collate_fn, num_workers=0)
 
-    from sc_model import sc_greedy_decode
+    from lib.sc_model import sc_greedy_decode
     device = next(model.parameters()).device
     ref_by_id = {r["id"]: r.get("rec_text", "") for r in dataset.rows}
     dur_by_id = {r["id"]: r.get("duration", 0.0) for r in dataset.rows}
@@ -309,7 +330,7 @@ def add_hybrid_sims(samples, rows, entry, split, data_root, log=print,
     追加滑窗分段精判，取各窗 sim 的 max 作为最终 sim（抗重叠污染）。
     """
     import numpy as np
-    from sc_data import emb_path
+    from lib.sc_data import emb_path
 
     hub = ModelHub()
     hub._load_wespeaker(log)  # 只加载声纹模型（CPU），不动 funasr
@@ -362,9 +383,9 @@ def run_sx_artifacts(samples, rows, entry, split, data_root,
     """
     import numpy as np
     import torch
-    from sc_data import emb_path, read_wav
-    from sc_model import sc_greedy_decode
-    from sx_model import sx_load
+    from lib.sc_data import emb_path, read_wav
+    from lib.sc_model import sc_greedy_decode
+    from lib.sx_model import sx_load
 
     device = next(sc_model.parameters()).device
     sx = sx_load(args.sx_checkpoint, device=device, log=log)
@@ -496,6 +517,12 @@ def build_parser():
                          "⚠️ 已证伪并默认关闭（默认 0.0）：正/拒样本 RMS 分布重叠，"
                          "且该硬截止会误杀音量偏低的正样本（rms≈0.006 时 sim_sx 仍可高达 0.6）。"
                          "保留参数仅供复现阶段D旧结果")
+    ap.add_argument("--final", action="store_true",
+                    help="最终系统一键评估（第四周定版）：自动填入 SX/SC-scx 最终"
+                         "checkpoint、灰区 0.05:0.60 与混合通路（能量门控默认关闭）。"
+                         "输出 5 配置消融表，sx-gate/sx-asr 行即最终系统"
+                         "（预期综合分 ≈0.7813）；可用 --sc-checkpoint/"
+                         "--sx-checkpoint/--gate-refine 显式覆盖")
     ap.add_argument("--device", default=None, help="cpu / cuda:0（默认自动）")
     ap.add_argument("--limit", type=int, default=0, help="仅评估前 N 条（调试用）")
     ap.add_argument("--output", default=None,
@@ -511,6 +538,14 @@ def run(args):
     """执行评估，返回结果 JSON 路径（供菜单 / UI 复用）"""
     global _PROGRESS_ENABLED
     _PROGRESS_ENABLED = getattr(args, "progress", False)
+
+    # --final：最终系统一键评估，填默认 checkpoint / 灰区 / 混合通路
+    # （仅当用户未显式给出时；显式参数优先级更高）
+    if getattr(args, "final", False):
+        args.sc_checkpoint = args.sc_checkpoint or FINAL_SC_CKPT
+        args.sx_checkpoint = args.sx_checkpoint or FINAL_SX_CKPT
+        args.gate_refine = args.gate_refine or FINAL_GATE_REFINE
+        args.sc_hybrid = True
 
     # 定位数据集与 manifest
     entry = ds.resolve_dataset(args.dataset)
@@ -530,7 +565,7 @@ def run(args):
 
     # ---- SC-Paraformer 通路：输出空=拒识，无阈值 ----
     if getattr(args, "sc_checkpoint", None):
-        from sc_model import build_sc_model
+        from lib.sc_model import build_sc_model
         ckpt = resolve_sc_checkpoint(args.dataset, args.sc_checkpoint)
         device = args.device or ("cuda:0" if __import__("torch").cuda.is_available()
                                  else "cpu")

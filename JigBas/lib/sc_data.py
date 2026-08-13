@@ -18,9 +18,14 @@ import json
 import os
 import sys
 
+# 直接运行本脚本时把项目根加入 sys.path（python lib/sc_data.py）；
+# 作为模块被导入时跳过（此时 lib 包已可导入）。
+if __package__ in (None, ""):
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import numpy as np
 
-import datasets as ds
+from lib import datasets as ds
 
 EMB_DIR = "spk_emb"          # 数据集文件夹内的嵌入缓存子目录
 IGNORE_ID = -1               # 与 funasr 训练一致：padding 用 -1
@@ -56,14 +61,14 @@ def extract_embeddings(dataset, split, hub=None, limit=0, log=print):
         rows = rows[:limit]
 
     if hub is None:
-        from models import ModelHub
+        from lib.models import ModelHub
         hub = ModelHub()
         # 只加载 wespeaker（提取嵌入用不到 ASR 模型，省下加载时间）
         hub._load_wespeaker(log)
         if hub.status["wespeaker"] != "就绪":
             raise RuntimeError("wespeaker 加载失败")
 
-    from models import extract_embedding
+    from lib.models import extract_embedding
 
     n_new = n_skip = 0
     total = len(rows)
@@ -175,7 +180,7 @@ def collate_fn(batch):
 def smoke_test(dataset, batch_size=8, log=print):
     import torch
     from funasr.auto.auto_model import AutoModel
-    from models import FUNASR_MODEL_DIR
+    from lib.models import FUNASR_MODEL_DIR
 
     log(f"[冒烟] 加载模型组件（build_model: {os.path.basename(FUNASR_MODEL_DIR)}）...")
     model, kwargs = AutoModel.build_model(model=FUNASR_MODEL_DIR)

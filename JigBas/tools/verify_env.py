@@ -16,11 +16,13 @@ import warnings
 from contextlib import redirect_stdout
 import numpy as np
 
+# 直接运行本脚本时把项目根加入 sys.path（python tools/verify_env.py）
+if __package__ in (None, ""):
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 warnings.filterwarnings("ignore")
 
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-MODELS_DIR = os.path.join(PROJECT_ROOT, "Models")
-FUNASR_MODEL_DIR = os.path.join(MODELS_DIR, "speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch")
+from lib.paths import REPO_ROOT, MODELS_DIR, FUNASR_MODEL_DIR
 
 
 def _generate_test_audio(output_path, duration=3.0, sample_rate=16000):
@@ -151,7 +153,7 @@ def run_verification(audio_path=None):
 
     # 2. 确定测试音频
     if audio_path is None:
-        audio_path = os.path.join(PROJECT_ROOT, "test_audio.wav")
+        audio_path = os.path.join(REPO_ROOT, "test_audio.wav")
     if not os.path.exists(audio_path):
         _generate_test_audio(audio_path)
     else:

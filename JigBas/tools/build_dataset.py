@@ -38,10 +38,14 @@ import re
 import sys
 import time
 
+# 直接运行本脚本时把项目根加入 sys.path（python tools/build_dataset.py）
+if __package__ in (None, ""):
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import numpy as np
 import soundfile as sf
 
-import datasets as ds
+from lib import datasets as ds
 
 SAMPLE_RATE = 16000
 

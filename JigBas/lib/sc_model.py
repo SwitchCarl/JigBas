@@ -239,7 +239,7 @@ def build_sc_model(device="cuda:0", sc_checkpoint=None, log=print):
     apply_cif_fix(log)
     apply_predictor_fix(log)
     from funasr.auto.auto_model import AutoModel
-    from models import FUNASR_MODEL_DIR
+    from lib.models import FUNASR_MODEL_DIR
 
     model, kwargs = AutoModel.build_model(model=FUNASR_MODEL_DIR, device=device)
     model = to_sc_paraformer(model)

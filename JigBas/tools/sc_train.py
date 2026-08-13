@@ -17,12 +17,16 @@ import os
 import sys
 import time
 
+# 直接运行本脚本时把项目根加入 sys.path（python tools/sc_train.py）
+if __package__ in (None, ""):
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-import datasets as ds
-from sc_data import SCDataset, collate_fn
+from lib import datasets as ds
+from lib.sc_data import SCDataset, collate_fn
 
 _PROGRESS_ENABLED = False
 
@@ -49,7 +53,7 @@ def run_step(model, frontend, batch, device):
 
 
 def train(args, log=print):
-    from sc_model import build_sc_model
+    from lib.sc_model import build_sc_model
 
     device = args.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)

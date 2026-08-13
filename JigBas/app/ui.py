@@ -22,16 +22,21 @@ import logging
 import warnings
 import unicodedata
 
-import datasets as ds
-import build_dataset as bd
-from models import ModelHub
-from demo import (recognize, recognize_sc, load_sc_engine,
-                  DEFAULT_THRESHOLD, SC_DEFAULT_THRESHOLD, SC_GRAY_ZONE)
+# 直接运行本脚本时把项目根加入 sys.path（python app/ui.py --ui-child）
+if __package__ in (None, ""):
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from lib import datasets as ds
+from lib.models import ModelHub
+from lib.paths import REPO_ROOT
+from tools import build_dataset as bd
+from app.demo import (recognize, recognize_sc, load_sc_engine,
+                      recognize_sx, load_final_engine,
+                      DEFAULT_THRESHOLD, SC_DEFAULT_THRESHOLD,
+                      SX_DEFAULT_THRESHOLD, SC_GRAY_ZONE)
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
-
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 UI_CHILD_FLAG = "--ui-child"
 WINDOW_TITLE = "JigBas — 抗干扰语音指令识别系统"
@@ -321,6 +326,30 @@ def ensure_sc_engine():
     threading.Thread(target=run, daemon=True).start()
 
 
+# 最终系统（第四周定版）：SX 提取器 + SC-scx，选中 sx 模式后后台预载
+final_engine = None        # (sx_model, sc_model, sc_kwargs)，就绪后由 demo.recognize_sx 使用
+final_status = "未加载"    # 未加载 / 加载中 / 就绪 / 失败
+
+
+def ensure_final_engine():
+    """后台预载最终系统（幂等）；已就绪或失败不再重复触发"""
+    global final_engine, final_status
+    if final_engine is not None or final_status in ("加载中", "失败"):
+        return
+
+    def run():
+        global final_engine, final_status
+        try:
+            final_engine = load_final_engine(log=lambda m: print(m, flush=True))
+            final_status = "就绪"
+        except Exception as e:
+            print(f"[UI] 最终系统加载失败: {e}", flush=True)
+            final_status = "失败"
+
+    final_status = "加载中"
+    threading.Thread(target=run, daemon=True).start()
+
+
 def load_progress():
     """模型加载总进度 [0,1]：Wespeaker 占前 50%，FunASR 占后 50%"""
     seg = {"等待": 0.0, "加载中": 0.5, "就绪": 1.0, "失败": 1.0}
@@ -368,6 +397,7 @@ EVAL_PARAMS = [
     ("split",  "划分",     "toggle:train:dev"),
     ("sweep",  "阈值扫描", "text"),
     ("limit",  "条数限制", "num"),
+    ("final",  "最终系统", "toggle"),
     ("detail", "逐样本明细", "toggle"),
 ]
 
@@ -382,7 +412,7 @@ class AppState:
         # 基础演示
         self.wake_path = ""
         self.audio_path = ""
-        self.demo_mode = "baseline"  # baseline=旧基线 / sc=SC 混合系统
+        self.demo_mode = "baseline"  # baseline / sc / sx（三模式）
         self.threshold = DEFAULT_THRESHOLD
         self.demo_focus = 0
         self.is_running = False
@@ -401,6 +431,7 @@ class AppState:
         self.eval_split = "dev"
         self.eval_sweep = "0.30:0.75:0.05"
         self.eval_limit = "0"
+        self.eval_final = False
         self.eval_detail = True
 
         # 长任务（构建/评估）运行状态
@@ -415,10 +446,17 @@ DEMO_MODULES = ["wake", "rec", "mode", "threshold", "start"]
 # 各模块在焦点列表中的下标（避免魔法数字）
 DEMO_IDX = {name: i for i, name in enumerate(DEMO_MODULES)}
 
+# 基础演示三模式（左右键循环）与各模式的推荐阈值
+DEMO_MODES = ("baseline", "sc", "sx")
+DEMO_MODE_THRESHOLD = {"baseline": DEFAULT_THRESHOLD,
+                       "sc": SC_DEFAULT_THRESHOLD,
+                       "sx": SX_DEFAULT_THRESHOLD}
+
 # 识别各阶段: (起始进度, 结束进度, 预估秒数, 描述)
 RUN_STAGES = {
     "wake": (0.05, 0.30, 1.5, "提取唤醒音频声纹"),
     "rec":  (0.30, 0.55, 1.5, "提取识别音频声纹"),
+    "sx":   (0.30, 0.55, 2.0, "SX 提取目标人声"),
     "asr":  (0.55, 0.95, 5.0, "ASR 语音转写"),
 }
 
@@ -566,14 +604,17 @@ def demo_rows():
     rows += hcat(wake, rec)
     rows.append("")
 
-    # 识别模式（基线 / SC 混合，左右键切换）
+    # 识别模式（基线 / SC 混合 / 最终系统，左右键循环）
     if state.demo_mode == "sc":
         mode_txt = "SC 混合（两级门控 + SC-Paraformer）"
-        sc_note = f"  SC 模型: {sc_status}"
+        mode_note = f"  SC 模型: {sc_status}"
+    elif state.demo_mode == "sx":
+        mode_txt = "最终系统（SX 提取 + 声纹门控 + SC-scx）"
+        mode_note = f"  最终引擎: {final_status}"
     else:
         mode_txt = "基线（声纹比对 + Paraformer）"
-        sc_note = ""
-    mode_lines = [f"◀ {C_TITLE}{mode_txt}{C_RESET} ▶{C_DIM}{sc_note}{C_RESET}"]
+        mode_note = ""
+    mode_lines = [f"◀ {C_TITLE}{mode_txt}{C_RESET} ▶{C_DIM}{mode_note}{C_RESET}"]
     mode_box = make_box("识别模式", mode_lines, CONTENT_W,
                         sel and state.demo_focus == DEMO_IDX["mode"])
     rows += mode_box
@@ -677,7 +718,22 @@ def start_recognition():
     _set_stage("wake")
 
     def work():
-        if state.demo_mode == "sc":
+        if state.demo_mode == "sx":
+            # 最终系统：SX 提取器 + SC-scx，首次加载较久（~60s+）
+            ensure_final_engine()
+            while final_engine is None and final_status != "失败":
+                time.sleep(0.2)
+            if final_engine is None:
+                state.result_lines = [
+                    f"{C_ERR}最终系统加载失败，详见原窗口日志{C_RESET}"]
+                state.is_running = False
+                return
+            result = recognize_sx(
+                hub, final_engine[0], final_engine[1], final_engine[2],
+                state.wake_path, state.audio_path, state.threshold,
+                gray=SC_GRAY_ZONE,
+                on_stage=_set_stage, log=lambda m: print(m, flush=True))
+        elif state.demo_mode == "sc":
             # SC 混合系统：引擎未就绪则等待后台预载（首次约 40s）
             ensure_sc_engine()
             while sc_engine is None and sc_status != "失败":
@@ -701,7 +757,8 @@ def start_recognition():
             state.result_lines = [f"{C_ERR}识别失败: {result['error']}{C_RESET}"]
         else:
             sim = result["similarity"]
-            tag = "SC 混合" if state.demo_mode == "sc" else "基线"
+            tag = {"sc": "SC 混合", "sx": "最终系统"}.get(state.demo_mode,
+                                                        "基线")
             refine_note = ("（分段精判后）" if result.get("refined") else "")
             lines = [
                 f"唤醒: {truncate_middle(state.wake_path, 76)}",
@@ -745,7 +802,7 @@ def start_task(kind, cmd):
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, encoding="utf-8", errors="replace",
-        cwd=PROJECT_ROOT, env=env)
+        cwd=REPO_ROOT, env=env)
     state.task = {
         "kind": kind, "proc": proc, "t0": time.time(),
         "progress": {"phase": "scan" if kind == "build" else "infer",
@@ -905,7 +962,8 @@ def eval_param_lines():
             ("划分", state.eval_split, 0),
             ("阈值扫描", state.eval_sweep, 1),
             ("条数限制(0=全部)", state.eval_limit, 2),
-            ("逐样本明细", "是" if state.eval_detail else "否", 3)]
+            ("最终系统", "是" if state.eval_final else "否", 3),
+            ("逐样本明细", "是" if state.eval_detail else "否", 4)]
     lines = []
     for label, val, idx in rows:
         focused = (idx is not None and state.zone == "param"
@@ -932,14 +990,11 @@ def dataset_detail_lines(entry):
         lines.append(f"{C_DIM}参数: seed={p.get('seed')} reject={p.get('reject_ratio')}"
                      f" overlap={p.get('overlap_prob')} trim={p.get('trim')}{C_RESET}")
     ev = entry.get("latest_eval")
-    if ev:
-        best = ev.get("best_threshold")
-        m = next((x for x in ev.get("metrics", [])
-                  if x.get("threshold") == best), None)
-        if m:
-            lines.append(f"最近评估: 阈值 {best}  CER {C_TITLE}{m['cer']:.1%}{C_RESET}"
-                         f"  RR {C_TITLE}{m['rr']:.1%}{C_RESET}"
-                         f"  RTF {ev.get('rtf')}")
+    m = ds.best_metric(ev)
+    if m:
+        lines.append(f"最近评估: 阈值 {m['threshold']}  CER {C_TITLE}{m['cer']:.1%}{C_RESET}"
+                     f"  RR {C_TITLE}{m['rr']:.1%}{C_RESET}"
+                     f"  RTF {ev.get('rtf')}")
     else:
         lines.append(f"{C_DIM}（尚未评估）{C_RESET}")
     return lines
@@ -1007,14 +1062,14 @@ def main_signature():
     parts = [
         state.layer, str(state.module), state.message,
         str(state.demo_focus), f"{state.threshold:.2f}",
-        state.demo_mode, sc_status,
+        state.demo_mode, sc_status, final_status,
         state.wake_path, state.audio_path,
         str(state.is_running), state.run_stage,
         "".join(strip_ansi(l) for l in state.result_lines),
         state.zone, str(state.entry), str(state.param_idx), str(state.ds_sel),
         json.dumps(state.build_vals, sort_keys=True),
         state.eval_split, state.eval_sweep, state.eval_limit,
-        str(state.eval_detail), str(state.task_acked),
+        str(state.eval_final), str(state.eval_detail), str(state.task_acked),
         "|".join(e["name"] for e in state.ds_entries),
     ]
     if state.is_running:
@@ -1091,13 +1146,15 @@ def handle_demo_key(key):
             delta = 0.05 if key == "RIGHT" else -0.05
             state.threshold = round(min(1.0, max(0.0, state.threshold + delta)), 2)
         elif mod == "mode":
-            state.demo_mode = ("sc" if state.demo_mode == "baseline"
-                               else "baseline")
-            # 切换到各模式的推荐阈值；sc 首次选中即后台预载模型
-            state.threshold = (SC_DEFAULT_THRESHOLD if state.demo_mode == "sc"
-                               else DEFAULT_THRESHOLD)
+            # 三模式循环：baseline → sc → sx；切到各模式用推荐阈值，
+            # sc/sx 首次选中即后台预载对应引擎
+            i = DEMO_MODES.index(state.demo_mode)
+            state.demo_mode = DEMO_MODES[(i + 1) % len(DEMO_MODES)]
+            state.threshold = DEMO_MODE_THRESHOLD[state.demo_mode]
             if state.demo_mode == "sc":
                 ensure_sc_engine()
+            elif state.demo_mode == "sx":
+                ensure_final_engine()
         elif mod in ("wake", "rec"):
             state.demo_focus = (DEMO_IDX["rec"]
                                 if state.demo_focus == DEMO_IDX["wake"]
@@ -1236,6 +1293,8 @@ def adjust_param(delta):
             state.eval_split = "train" if state.eval_split == "dev" else "dev"
         elif item == "detail":
             state.eval_detail = not state.eval_detail
+        elif item == "final":
+            state.eval_final = not state.eval_final
         elif item == "limit":
             v = max(0, int(_num(state.eval_limit)) + delta * 50)
             state.eval_limit = str(v)
@@ -1283,7 +1342,7 @@ def browse_param():
 def launch_build():
     v = state.build_vals
     cmd = [sys.executable, "-u",
-           os.path.join(PROJECT_ROOT, "build_dataset.py"),
+           os.path.join(REPO_ROOT, "tools", "build_dataset.py"),
            "--alias", v["alias"],
            "--clean-dir", v["clean_dir"],
            "--noise-dir", v["noise_dir"],
@@ -1305,7 +1364,7 @@ def launch_eval():
         return
     name = state.ds_entries[state.ds_sel]["name"]
     cmd = [sys.executable, "-u",
-           os.path.join(PROJECT_ROOT, "evaluate.py"),
+           os.path.join(REPO_ROOT, "app", "evaluate.py"),
            "--dataset", name,
            "--split", state.eval_split,
            "--sweep", state.eval_sweep,
@@ -1313,6 +1372,8 @@ def launch_eval():
     limit = int(_num(state.eval_limit))
     if limit > 0:
         cmd += ["--limit", str(limit)]
+    if state.eval_final:
+        cmd += ["--final"]
     if state.eval_detail:
         cmd += ["--detail"]
     start_task("eval", cmd)
@@ -1402,7 +1463,7 @@ def main():
         encoding="utf-8",
         errors="replace",
         creationflags=creationflags,
-        cwd=PROJECT_ROOT,
+        cwd=REPO_ROOT,
     )
     print("[UI] 界面已在独立窗口启动，日志输出如下：", flush=True)
     try:
