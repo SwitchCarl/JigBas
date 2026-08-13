@@ -396,6 +396,7 @@ dist/
 build/
 # Release 打包产物（package_release.py 生成，不入库）
 submit/
+submit_*.zip
 
 # Jupyter Notebook
 .ipynb_checkpoints/
