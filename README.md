@@ -85,7 +85,6 @@ python JigBas.py
 - `id` = 测试音频名字；拒识样本 `content`/`label` 为空。
 - `final_cer` = 全部正样本聚合编辑距离 / 总字数（与 `evaluate` 同口径）。
 - `duration` = batch=1 推理全部音频的总秒数（对应效率指标 10%）。
-- 测试集 B 不公开：赛前用官方样例格式自建模拟集走通 `submit.py`，决赛现场跑官方集。
 
 ## 最终系统权重
 
@@ -97,7 +96,3 @@ python JigBas.py
 权重在仓库外（`E:/Desktop/Jigbas/Temp/Datasets/`），demo / eval --final / submit
 默认读取；可用 `--sx-checkpoint` / `--sc-checkpoint` 覆盖。
 
-## 版本
-
-交付版本用 git tag 标记（如 `v1.0-final`），`tools/package_release.py` 生成 `submit/`
-交付目录后即可挂 Release。
