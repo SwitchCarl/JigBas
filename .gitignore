@@ -404,3 +404,6 @@ submit_*.zip
 # Environment
 .env
 .venv
+
+# 项目 CLAUDE.md 指针（完整内容在仓库外 ../Temp/CLAUDE.md，指针不入库）
+/CLAUDE.md
