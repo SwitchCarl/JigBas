@@ -28,14 +28,16 @@ import soundfile as sf
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from lib.paths import DATASETS_ROOT
 from lib.sc_data import read_wav, emb_path
 from lib.sx_model import sx_load, SAMPLE_RATE
 
-# 默认路径（与最终系统一致）
-DEFAULT_SRC = r"E:/Desktop/Jigbas/Temp/Datasets/20260810_0045_train8k"
-DEFAULT_DST = r"E:/Desktop/Jigbas/Temp/Datasets/20260813_0105_scx8k"
-DEFAULT_CKPT = (r"E:/Desktop/Jigbas/Temp/Datasets/20260811_1914_sxtrain/"
-                r"checkpoints/sx_20260812_235228/step_6000.pt")
+# 默认路径（与最终系统一致，相对推导可随项目迁移）
+DEFAULT_SRC = os.path.join(DATASETS_ROOT, "20260810_0045_train8k")
+DEFAULT_DST = os.path.join(DATASETS_ROOT, "20260813_0105_scx8k")
+DEFAULT_CKPT = os.path.join(
+    DATASETS_ROOT, "20260811_1914_sxtrain", "checkpoints",
+    "sx_20260812_235228", "step_6000.pt")
 BATCH = 16
 
 

@@ -25,17 +25,19 @@ import time
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from lib.paths import REPO_ROOT, MODELS_DIR
+from lib.paths import REPO_ROOT, MODELS_DIR, DATASETS_ROOT
 
 # 参与交付的包 / 文件（tools/ 训练工具不交付）
 PACKAGE_DIRS = ["lib", "app"]
 PACKAGE_FILES = ["JigBas.py", "requirements.txt"]
 
-# 最终系统权重（README 注明位置；实际在仓库外 Temp/Datasets）
-FINAL_SX_CKPT = ("E:/Desktop/Jigbas/Temp/Datasets/20260811_1914_sxtrain/"
-                 "checkpoints/sx_20260812_235228/step_6000.pt")
-FINAL_SC_CKPT = ("E:/Desktop/Jigbas/Temp/Datasets/20260813_0105_scx8k/"
-                 "checkpoints/sc_20260813_cont4000/step_4000.pt")
+# 最终系统权重（README 注明位置；实际在仓库外 DATASETS_ROOT 下，相对推导可随迁移）
+FINAL_SX_CKPT = os.path.join(
+    DATASETS_ROOT, "20260811_1914_sxtrain", "checkpoints",
+    "sx_20260812_235228", "step_6000.pt")
+FINAL_SC_CKPT = os.path.join(
+    DATASETS_ROOT, "20260813_0105_scx8k", "checkpoints",
+    "sc_20260813_cont4000", "step_4000.pt")
 
 
 def _copy_tree(src, dst):
@@ -86,7 +88,7 @@ sim_sx ≥ 0.30 接受）→ SC-scx 在提取音频上转写。
 | SC-scx ASR | 提取音频上转写 | `{FINAL_SC_CKPT}` |
 | Paraformer | 基线 ASR / SC 底座 | `Models/speech_paraformer-.../`（本包） |
 
-权重默认在仓库外 `E:/Desktop/Jigbas/Temp/Datasets/`。若测试机路径不同，
+权重默认在仓库外 `{DATASETS_ROOT}`。若测试机路径不同，
 用 `--sx-checkpoint` / `--sc-checkpoint` 显式指定（demo / eval --final /
 submit 均支持）。
 
