@@ -11,6 +11,53 @@ from lib.paths import FUNASR_MODEL_DIR
 
 FUNASR_MODEL_ID = "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch"
 
+
+def _patch_torch_jit_load():
+    """兼容 torch.jit.load 的中文路径问题（归档迁移到 E:\归档 等含中文路径时必需）。
+
+    背景：torch.jit.load 底层用 C 的 fopen 打开文件，Windows 上 ANSI 编码的
+    fopen 无法打开含中文的路径；torch.load 则无此问题。项目代码全部用
+    torch.load / 不受影响，只有第三方 silero_vad（经 wespeaker）用
+    torch.jit.load 加载 silero_vad.jit，归档到中文路径后即失败。
+
+    补丁逻辑：探测到路径含非 ASCII 字符时，先复制到系统临时目录
+    （纯 ASCII）再加载，加载完即删除副本。幂等，可安全重复调用。
+    """
+    try:
+        import torch
+    except ImportError:
+        return  # torch 未安装，无需打补丁
+
+    if getattr(torch.jit, "_jigbas_cn_path_patched", False):
+        return  # 已打过补丁
+
+    _orig = torch.jit.load
+
+    def _load(path, *args, **kwargs):
+        p = str(path)
+        try:
+            p.encode("ascii")
+            return _orig(path, *args, **kwargs)
+        except UnicodeEncodeError:
+            import shutil
+            import tempfile
+            tmp = os.path.join(tempfile.gettempdir(), os.path.basename(p))
+            shutil.copy2(p, tmp)
+            try:
+                return _orig(tmp, *args, **kwargs)
+            finally:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+
+    torch.jit.load = _load
+    torch.jit._jigbas_cn_path_patched = True
+
+
+# 模块加载即打补丁（本模块是所有模型加载的集中入口）
+_patch_torch_jit_load()
+
 # 模型加载状态
 STATUS_WAITING = "等待"
 STATUS_LOADING = "加载中"

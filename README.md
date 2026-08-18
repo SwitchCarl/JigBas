@@ -93,6 +93,6 @@ python JigBas.py
 | SX 提取器（阶段C 纯分离，未微调） | `Temp/Datasets/20260811_1914_sxtrain/checkpoints/sx_20260812_235228/step_6000.pt` |
 | SC-scx ASR（提取音频上微调，abs 8000 步） | `Temp/Datasets/20260813_0105_scx8k/checkpoints/sc_20260813_cont4000/step_4000.pt` |
 
-权重在仓库外（`E:/Desktop/Jigbas/Temp/Datasets/`），demo / eval --final / submit
+权重在仓库外（`Temp/Datasets/`，路径由 lib/paths.py 相对推导、随项目整体迁移自动跟随），demo / eval --final / submit
 默认读取；可用 `--sx-checkpoint` / `--sc-checkpoint` 覆盖。
 

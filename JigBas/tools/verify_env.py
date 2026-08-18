@@ -24,6 +24,10 @@ warnings.filterwarnings("ignore")
 
 from lib.paths import REPO_ROOT, MODELS_DIR, FUNASR_MODEL_DIR
 
+# 直跑本脚本也打 torch.jit.load 中文路径补丁（归档路径含中文时 wespeaker 需要）
+from lib.models import _patch_torch_jit_load
+_patch_torch_jit_load()
+
 
 def _generate_test_audio(output_path, duration=3.0, sample_rate=16000):
     """生成 440Hz 正弦波测试音频"""

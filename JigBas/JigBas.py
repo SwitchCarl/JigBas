@@ -107,6 +107,11 @@ def _list_datasets():
 def _run_module(module, argv):
     """重组 sys.argv = [<脚本名>] + 剩余参数，再调目标模块的 main()，
     参数天然透传（目标模块用 argparse 自己解析）。"""
+    # 先打 torch.jit.load 中文路径补丁（见 lib/models.py 说明），
+    # 确保被调模块内 wespeaker/silero_vad 加载不受归档中文路径影响。
+    from lib.models import _patch_torch_jit_load
+    _patch_torch_jit_load()
+
     mod = importlib.import_module(module)
     sys.argv = [mod.__file__] + list(argv)
     return mod.main()
